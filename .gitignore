@@ -1,0 +1,38 @@
+# Local configuration and private research
+.env
+.env.*
+!.env.example
+/data/
+/output/
+/private/
+/credentials/
+/desktop/runtime-paths.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.log
+*.sqlite*
+*.db
+
+# Environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+.DS_Store
+
+# Hidden local workspace state
+.*
+!.env.example
+!.gitignore
+!.github/

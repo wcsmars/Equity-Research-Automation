@@ -1,0 +1,41 @@
+{
+  "name": "equity-research-copilot-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Native macOS wrapper for the Equity Research Copilot (DCF/DDM/comps valuation + AI analyst).",
+  "author": "wcsmars",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "configure-runtime": "node configure-runtime.js",
+    "predist": "npm run configure-runtime",
+    "dist": "electron-builder --dir",
+    "predmg": "npm run configure-runtime",
+    "dmg": "electron-builder --mac dmg"
+  },
+  "devDependencies": {
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.0"
+  },
+  "build": {
+    "appId": "com.wcsmars.equityresearchcopilot",
+    "productName": "Equity Research Copilot",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": { "output": "dist" },
+    "files": [
+      "main.js",
+      "preload.js",
+      "loading.html",
+      "runtime-paths.json",
+      "assets/**",
+      "package.json"
+    ],
+    "mac": {
+      "target": ["dir"],
+      "category": "public.app-category.finance",
+      "icon": "assets/icon.icns"
+    }
+  }
+}
