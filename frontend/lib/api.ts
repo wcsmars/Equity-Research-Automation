@@ -19,7 +19,7 @@ import type {
 // In the desktop (Electron) app the backend runs on a dynamic port that the
 // shell injects as ?api=<port>. Next.js bakes rewrites() at build time, so the
 // production proxy can't target a runtime port — instead we call the backend
-// directly (its CORS is open). On the web/dev build there's no ?api param, so
+// directly (its CORS allows any localhost origin). On the web/dev build there's no ?api param, so
 // API_BASE is "" and requests stay same-origin and use the Next rewrite.
 export function apiBase(): string {
   if (typeof window !== "undefined") {

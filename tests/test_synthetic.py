@@ -149,7 +149,18 @@ def main() -> int:
         finite = [v for row in g.grid for v in row if isinstance(v, float) and math.isfinite(v)]
         passed &= _ok(len(finite) > 0 and all(v > 0 for v in finite),
                       "sensitivity grid has positive finite prices")
-        # monotonic check: higher WACC -> lower price (first grid is WACC x growth)
+        # Rows ascend in WACC, so every column must be non-increasing top to bottom.
+        rows = g.grid
+        pairs = [
+            (rows[i][j], rows[i + 1][j])
+            for i in range(len(rows) - 1)
+            for j in range(len(g.col_values))
+        ]
+        finite_pairs = [(a, b) for a, b in pairs
+                        if isinstance(a, float) and isinstance(b, float)
+                        and math.isfinite(a) and math.isfinite(b)]
+        passed &= _ok(finite_pairs and all(a >= b for a, b in finite_pairs),
+                      f"higher WACC -> lower implied price ({len(finite_pairs)} grid pairs)")
     from equity_valuation.schemas import ValuationReport
 
     report = ValuationReport(company=company, macro=macro, current_price=company.market.price,

@@ -380,7 +380,7 @@ export default function Home() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <div className="text-base font-semibold tracking-tight text-ink">
-            Equity Research <span className="text-brand">Copilot</span>
+            Equity Research <span className="text-brand">Automation</span>
           </div>
           <Badge tone="brand">DCF · Comps · Filings · AI</Badge>
         </div>

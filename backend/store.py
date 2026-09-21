@@ -1,4 +1,4 @@
-"""Tiny JSON persistence for the copilot's personal layer.
+"""Tiny JSON persistence for the app's personal layer.
 
 Holds the watchlist and per-ticker research state (notes, digests, generated
 research note, applied assumptions) in one file under the project's `data/`

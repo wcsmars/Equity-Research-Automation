@@ -475,8 +475,9 @@ def _comps_table(report: ValuationReport, symbol: str) -> str:
         cls = " class='target-row'" if highlight else ""
         return f"<tr{cls}>{''.join(cells)}</tr>"
 
+    peers = getattr(comps, "peers", []) or []
     body = [row_cells(getattr(comps, "target", None), highlight=True)]
-    for peer in (getattr(comps, "peers", []) or []):
+    for peer in peers:
         body.append(row_cells(peer))
 
     # Stats footer (median/mean/min/max/p25/p75) per multiple.
@@ -485,7 +486,9 @@ def _comps_table(report: ValuationReport, symbol: str) -> str:
     stat_labels = {"median": "Median", "mean": "Mean", "min": "Min",
                    "max": "Max", "p25": "25th pct", "p75": "75th pct"}
     stat_rows = []
-    for sk in stat_keys:
+    # Without peers there are no statistics; skip the footer instead of
+    # rendering rows of n/a under the target.
+    for sk in (stat_keys if peers else ()):
         cells = [f"<td class='rowhead'>{stat_labels[sk]}</td><td></td><td></td>"]
         for mk in mult_keys:
             sub = stats.get(mk) or {}
@@ -637,8 +640,11 @@ def _footnotes_html(report: ValuationReport) -> str:
     src_notes = getattr(getattr(report, "company", None), "source_notes", None) or []
     warnings = report.warnings or []
     note_items = []
+    # The engine already merges source notes into report.warnings; only render
+    # the ones that did not make it there so nothing appears twice.
     for n in src_notes:
-        note_items.append(f"<li>{_esc(n)}</li>")
+        if n not in warnings:
+            note_items.append(f"<li>{_esc(n)}</li>")
     for w in warnings:
         note_items.append(f"<li class='warn'>{_esc(w)}</li>")
     notes_block = ""

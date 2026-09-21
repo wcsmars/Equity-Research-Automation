@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the full Equity Research Copilot: FastAPI backend + Next.js frontend.
+# Launch the full Equity Research Automation: FastAPI backend + Next.js frontend.
 #
 #   cp .env.example .env   # add your ANTHROPIC_API_KEY / FMP_API_KEY (both optional)
 #   ./run_dev.sh

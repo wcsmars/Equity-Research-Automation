@@ -1,4 +1,4 @@
-# Equity Research Copilot — macOS app
+# Equity Research Automation — macOS app
 
 This Electron wrapper starts the Python backend and Next.js frontend on free
 local ports, loads the dashboard in a native window, and stops both servers
@@ -7,8 +7,8 @@ app.
 
 ## Run from source
 
-Use Python 3.11+ and Node.js 22.12+ with npm. From the root of this public
-distribution (the folder containing `run_dev.sh`):
+Use Python 3.11+ and Node.js 22.12+ with npm. From the repository root (the
+folder containing `run_dev.sh`):
 
 ```bash
 python3 -m venv .venv

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Equity Research Copilot",
+  title: "Equity Research Automation",
   description:
     "Type a ticker for an instant DCF/DDM/comps valuation, multiples, news, and an AI analyst you feed.",
 };

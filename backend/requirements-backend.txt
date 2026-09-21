@@ -5,6 +5,6 @@ anthropic>=0.69
 # Office artifacts (research memo / briefing deck)
 python-docx>=1.1
 python-pptx>=1.0
-# requests, pandas, numpy, yfinance, openpyxl, plotly, jinja2 come from
+# requests, pandas, numpy, yfinance, openpyxl, plotly come from
 # ../requirements.txt (the valuation engine). Install both:
 #   pip install -r ../requirements.txt -r requirements-backend.txt

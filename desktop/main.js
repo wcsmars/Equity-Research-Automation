@@ -1,4 +1,4 @@
-// Electron main process for Equity Research Copilot.
+// Electron main process for Equity Research Automation.
 //
 // On launch it starts the FastAPI backend (project venv Python) and the Next.js
 // production server on free local ports, injects keys from the project's .env
@@ -223,7 +223,7 @@ async function startServers(onLog) {
     NODE_ENV: "production",
   };
   if (USE_ELECTRON_NODE) fenv.ELECTRON_RUN_AS_NODE = "1";
-  frontendProc = spawn(NODE_BIN, [NEXT_CLI, "start", "-p", String(frontendPort)], {
+  frontendProc = spawn(NODE_BIN, [NEXT_CLI, "start", "-H", "127.0.0.1", "-p", String(frontendPort)], {
     cwd: FRONTEND_DIR,
     env: fenv,
   });
@@ -270,7 +270,7 @@ function createWindow() {
     minWidth: 1080,
     minHeight: 680,
     backgroundColor: "#080b12",
-    title: "Equity Research Copilot",
+    title: "Equity Research Automation",
     // Standard title bar: with "hiddenInset" the dashboard (which has no
     // -webkit-app-region styles) left the window impossible to drag.
     webPreferences: {

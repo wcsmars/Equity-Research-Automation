@@ -1,8 +1,8 @@
 {
-  "name": "equity-research-copilot-desktop",
+  "name": "equity-research-automation-desktop",
   "version": "1.0.0",
   "private": true,
-  "description": "Native macOS wrapper for the Equity Research Copilot (DCF/DDM/comps valuation + AI analyst).",
+  "description": "Native macOS wrapper for the Equity Research Automation (DCF/DDM/comps valuation + AI analyst).",
   "author": "wcsmars",
   "license": "MIT",
   "main": "main.js",
@@ -19,8 +19,8 @@
     "electron-builder": "^26.15.0"
   },
   "build": {
-    "appId": "com.wcsmars.equityresearchcopilot",
-    "productName": "Equity Research Copilot",
+    "appId": "com.wcsmars.equityresearchautomation",
+    "productName": "Equity Research Automation",
     "asar": true,
     "npmRebuild": false,
     "directories": { "output": "dist" },

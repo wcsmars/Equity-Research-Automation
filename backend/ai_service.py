@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     import anthropic
 
-MODEL = os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-opus-4-8"
+MODEL = os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-opus-5"
 
 # Assumption knobs the UI knows how to apply. Keep in sync with the frontend
 # applySuggestion() switch and valuation_service's request parsing.

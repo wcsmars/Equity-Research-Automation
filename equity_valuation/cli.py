@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--peers",
         default=None,
-        help="Comma-separated peer tickers for comps (else auto-suggested).",
+        help="Comma-separated peer tickers for comps (comps are skipped if omitted).",
     )
     p.add_argument("--out", default=config.DEFAULT_OUTPUT_DIR, help="Output directory.")
 

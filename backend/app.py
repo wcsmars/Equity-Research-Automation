@@ -23,7 +23,7 @@ from .fmp_client import FMPClient
 from .serialization import build_ai_context
 from .valuation_service import run_valuation
 
-app = FastAPI(title="Equity Research Copilot API", version="2.0.0")
+app = FastAPI(title="Equity Research Automation API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
