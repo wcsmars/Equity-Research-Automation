@@ -4,7 +4,8 @@ Runs every model without touching the network, so it isolates the financial math
 from flaky data sources. Run with:  python -m tests.test_synthetic
 (from the project root).
 
-The synthetic firm: steady grower, modestly levered, dividend payer, so DCF /
+The synthetic firm (``equity_valuation.data.synthetic``, also behind the CLI's
+``--demo`` flag): steady grower, modestly levered, dividend payer, so DCF /
 comps / DDM / FCFE all have something to chew on and we can assert on signs and
 rough magnitudes.
 """
@@ -14,11 +15,11 @@ from __future__ import annotations
 import math
 import sys
 
+from equity_valuation.data.synthetic import SyntheticProvider, make_company
 from equity_valuation.schemas import (
     AnnualFinancials,
     BalanceSheetSnapshot,
     CompanyData,
-    CompRow,
     DCFAssumptions,
     DDMAssumptions,
     MacroAssumptions,
@@ -28,68 +29,6 @@ from equity_valuation.schemas import (
 
 def _ramp(start: float, growth: float, n: int) -> list[float]:
     return [start * (1 + growth) ** i for i in range(n)]
-
-
-def make_company() -> CompanyData:
-    years = [2020, 2021, 2022, 2023, 2024]
-    rev = _ramp(80_000_000_000.0, 0.08, 5)          # $80B growing 8%/yr
-    ebit = [r * 0.25 for r in rev]                  # 25% EBIT margin
-    da = [r * 0.04 for r in rev]
-    ebitda = [e + d for e, d in zip(ebit, da)]
-    pretax = [e * 0.95 for e in ebit]               # small interest drag
-    tax = [p * 0.21 for p in pretax]
-    ni = [p - t for p, t in zip(pretax, tax)]
-    capex = [r * 0.05 for r in rev]
-    dnwc = [r * 0.01 for r in rev]
-    interest = [e * 0.05 for e in ebit]
-    div = [n * 0.30 for n in ni]                    # 30% payout
-    shares = [10_000_000_000.0] * 5
-
-    fin = AnnualFinancials(
-        fiscal_years=years, revenue=rev, ebit=ebit, ebitda=ebitda, net_income=ni,
-        dep_amort=da, capex=capex, change_in_nwc=dnwc, interest_expense=interest,
-        tax_expense=tax, pretax_income=pretax, dividends_paid=div, diluted_shares=shares,
-    )
-    bs = BalanceSheetSnapshot(
-        as_of="2024-12-31", total_debt=20_000_000_000.0,
-        cash_and_investments=8_000_000_000.0, total_equity=60_000_000_000.0,
-    )
-    eps = ni[-1] / shares[-1]
-    price = eps * 20.0                              # ~20x trailing P/E
-    mkt = MarketData(
-        ticker="SYNT", name="Synthetic Corp", currency="USD", price=price,
-        shares_outstanding=shares[-1], market_cap=price * shares[-1], beta=1.1,
-        dividend_per_share=div[-1] / shares[-1], fifty_two_week_low=price * 0.8,
-        fifty_two_week_high=price * 1.25, sector="Technology", industry="Software",
-    )
-    return CompanyData(ticker="SYNT", name="Synthetic Corp", cik=None,
-                       financials=fin, balance_sheet=bs, market=mkt)
-
-
-class _FakeProvider:
-    """Minimal DataProvider stand-in serving synthetic peer multiples."""
-
-    def get_company_data(self, ticker):  # not used here
-        return make_company()
-
-    def get_market_data(self, ticker):
-        return make_company().market
-
-    def suggest_peers(self, ticker):
-        return ["PEER1", "PEER2", "PEER3"]
-
-    def get_peer_comp_rows(self, tickers):
-        base = [
-            (18.0, 4.0, 19.0, 5.0, 1.6),
-            (22.0, 5.5, 24.0, 6.5, 2.1),
-            (20.0, 4.8, 21.0, 5.8, 1.8),
-        ]
-        rows = []
-        for tk, (eve, evs, pe, pb, peg) in zip(tickers, base):
-            rows.append(CompRow(ticker=tk, name=tk, market_cap=5e10,
-                                enterprise_value=5.2e10, ev_ebitda=eve, ev_sales=evs,
-                                pe=pe, pb=pb, peg=peg))
-        return rows
 
 
 def _ok(cond, msg):
@@ -123,7 +62,7 @@ def main() -> int:
     print("Comps:")
     from equity_valuation.models.comps import run_comps
 
-    comps = run_comps(company, _FakeProvider(), None, company.market.price)
+    comps = run_comps(company, SyntheticProvider(), None, company.market.price)
     passed &= _ok(len(comps.peers) == 3, f"3 peers: {len(comps.peers)}")
     passed &= _ok(comps.implied.get("ev_ebitda") and comps.implied["ev_ebitda"] > 0,
                   "EV/EBITDA implied price > 0")

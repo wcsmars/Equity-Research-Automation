@@ -2,6 +2,7 @@
 
     python -m equity_valuation AAPL
     python -m equity_valuation AAPL --peers MSFT,GOOGL,META --out output
+    python -m equity_valuation --demo          # synthetic company, no network
     python -m equity_valuation MSFT --rf 0.043 --erp 0.05 --terminal-growth 0.025 \
         --forecast-years 6 --no-ddm --excel --html
 """
@@ -34,7 +35,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Automated equity valuation: DCF, comps, DDM/FCFE, sensitivity "
         "-> Excel + HTML.",
     )
-    p.add_argument("ticker", help="Target ticker, e.g. AAPL")
+    p.add_argument("ticker", nargs="?", help="Target ticker, e.g. AAPL")
+    p.add_argument(
+        "--demo",
+        action="store_true",
+        help="Value the built-in synthetic company (SYNT) with three synthetic "
+        "peers, offline. Takes no ticker.",
+    )
     p.add_argument(
         "--peers",
         default=None,
@@ -101,7 +108,20 @@ def _print_summary(report) -> None:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    provider = None
+    if args.demo:
+        from .data.synthetic import DEMO_PEERS, DEMO_TICKER, SyntheticProvider
+
+        if args.ticker and args.ticker.strip().upper() != DEMO_TICKER:
+            parser.error("--demo values the synthetic company; omit the ticker.")
+        args.ticker = DEMO_TICKER
+        provider = SyntheticProvider()
+        if not args.peers:
+            args.peers = ",".join(DEMO_PEERS)
+    elif not args.ticker:
+        parser.error("a ticker is required (or use --demo for the offline example).")
 
     macro = MacroAssumptions(
         risk_free_rate=args.rf,
@@ -125,6 +145,7 @@ def main(argv=None) -> int:
     try:
         report = value_company(
             args.ticker,
+            provider=provider,
             macro=macro,
             dcf_assumptions=dcf_assumptions,
             ddm_assumptions=ddm_assumptions,

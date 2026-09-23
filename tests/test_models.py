@@ -12,11 +12,11 @@ from dataclasses import replace
 import math
 import unittest
 
+from equity_valuation.data.synthetic import make_company
 from equity_valuation.models.dcf import run_dcf
 from equity_valuation.models.ddm_fcfe import run_ddm
 from equity_valuation.models.wacc import compute_wacc
 from equity_valuation.schemas import DCFAssumptions, DDMAssumptions, MacroAssumptions
-from tests.test_synthetic import make_company
 
 
 def _close(a: float, b: float, rel: float = 1e-9) -> bool:

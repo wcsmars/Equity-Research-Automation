@@ -21,26 +21,22 @@ function isNum(x: unknown): x is number {
   return typeof x === "number" && Number.isFinite(x);
 }
 
+// The minus sign goes before the currency symbol: -$36.50, not $-36.50.
 export function fmtMoney(
   x: number | null | undefined,
   currency?: string | null,
   decimals = 2
 ): string {
   if (!isNum(x)) return "—";
-  return `${sym(currency)}${x.toLocaleString("en-US", {
+  const sign = x < 0 ? "-" : "";
+  return `${sign}${sym(currency)}${Math.abs(x).toLocaleString("en-US", {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   })}`;
 }
 
-// Compact large numbers: 391.0B, 1.2T, 540.0M.
-export function fmtBig(
-  x: number | null | undefined,
-  currency?: string | null
-): string {
-  if (!isNum(x)) return "—";
-  const s = sym(currency);
-  const abs = Math.abs(x);
+// Compact magnitude without sign or symbol: 391.0B, 1.2T, 540.0M.
+function compact(abs: number): string {
   const units: [string, number][] = [
     ["T", 1e12],
     ["B", 1e9],
@@ -48,9 +44,24 @@ export function fmtBig(
     ["K", 1e3],
   ];
   for (const [u, d] of units) {
-    if (abs >= d) return `${s}${(x / d).toFixed(1)}${u}`;
+    if (abs >= d) return `${(abs / d).toFixed(1)}${u}`;
   }
-  return `${s}${x.toFixed(0)}`;
+  return abs.toFixed(0);
+}
+
+// Compact money amounts: $391.0B, -$36.5B, €1.2T.
+export function fmtBig(
+  x: number | null | undefined,
+  currency?: string | null
+): string {
+  if (!isNum(x)) return "—";
+  return `${x < 0 ? "-" : ""}${sym(currency)}${compact(Math.abs(x))}`;
+}
+
+// Compact counts with no currency symbol (share counts): 7.4B, 540.0M.
+export function fmtCount(x: number | null | undefined): string {
+  if (!isNum(x)) return "—";
+  return `${x < 0 ? "-" : ""}${compact(Math.abs(x))}`;
 }
 
 export function fmtPct(

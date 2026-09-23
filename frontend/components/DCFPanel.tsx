@@ -7,6 +7,7 @@ import React from "react";
 import type { Assumptions, Report } from "@/lib/types";
 import {
   fmtBig,
+  fmtCount,
   fmtMoney,
   fmtMult,
   fmtNum,
@@ -119,7 +120,7 @@ export default function DCFPanel({
     { label: "Enterprise value", value: fmtBig(dcf.enterprise_value, cur), strong: true },
     { label: "(−) Net debt", value: fmtBig(dcf.net_debt, cur) },
     { label: "Equity value", value: fmtBig(dcf.equity_value, cur), strong: true },
-    { label: "Shares", value: fmtBig(dcf.shares) },
+    { label: "Shares", value: fmtCount(dcf.shares) },
     { label: "Implied price", value: fmtMoney(dcf.implied_price, cur), strong: true },
   ];
 

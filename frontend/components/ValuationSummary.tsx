@@ -7,6 +7,7 @@ import React from "react";
 import type { Report } from "@/lib/types";
 import {
   fmtBig,
+  fmtCount,
   fmtMoney,
   fmtNum,
   fmtPct,
@@ -156,7 +157,7 @@ export default function ValuationSummary({ report }: { report: Report }) {
           />
           <Stat
             label="Shares out"
-            value={fmtBig(m.shares_outstanding)}
+            value={fmtCount(m.shares_outstanding)}
           />
           <Stat
             label="Dividend / sh"

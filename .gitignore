@@ -2,10 +2,13 @@
 .env
 .env.*
 !.env.example
+config.yaml
+config.yml
 /data/
+**/data/raw/
 /output/
-/private/
-/credentials/
+private/
+credentials/
 /desktop/runtime-paths.json
 *.key
 *.pem

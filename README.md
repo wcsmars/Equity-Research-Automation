@@ -9,6 +9,10 @@ assumptions, filing analysis, saved research, and Word/PowerPoint exports.
 
 ![Dashboard overview for MSFT: blended fair value, verdict, and football field](docs/screenshots/overview.png)
 
+*Dashboard screenshots: MSFT on live data with the default inputs, captured for
+the September 2026 release. Live figures change with the market; the
+reproducible offline example is under [Results](#results).*
+
 ## Highlights
 
 - **Valuation engine written from scratch** in `equity_valuation/`: FCFF DCF with a
@@ -16,9 +20,9 @@ assumptions, filing analysis, saved research, and Word/PowerPoint exports.
   of equity and WACC on market-value weights, trading comps with per-multiple
   outlier trimming, DDM and FCFE, two-way sensitivity grids, and a football-field
   summary.
-- **Reverse DCF**: bisection on year-1 revenue growth to back out what the current
-  share price implies, so the model answers "what do I have to believe?" as well
-  as "what is it worth?".
+- **Reverse DCF** (dashboard, `backend/valuation_service.py`): bisection on
+  year-1 revenue growth to back out what the current share price implies, so the
+  model answers "what do I have to believe?" as well as "what is it worth?".
 - **EDGAR data layer**: XBRL company facts are normalized into annual statements
   keyed by reporting period rather than the XBRL fiscal-year field, so restated
   figures win and companies that switched tags still get a complete series.
@@ -37,25 +41,37 @@ assumptions, filing analysis, saved research, and Word/PowerPoint exports.
 | --- | --- |
 | Data | EDGAR annual financials, yfinance prices and peer multiples; yfinance fundamentals as a fallback |
 | DCF | Forecast FCFF, CAPM/WACC, Gordon-growth or exit-multiple terminal value, enterprise-to-equity bridge |
-| Reverse DCF | Bisection on year-1 revenue growth to back out the growth rate implied by the current price |
+| Reverse DCF | Dashboard only: bisection on year-1 revenue growth to back out the growth rate implied by the current price |
 | Comparables | Peer multiples, outlier trimming, median-based implied prices |
 | DDM / FCFE | Dividend and equity cash-flow valuations discounted at cost of equity |
 | Sensitivity | WACC/growth and margin/growth grids, plus valuation-range comparisons |
+| Decision | Blended target = median of the available DCF, comps-median, DDM and FCFE implied prices; verdict is Undervalued at +15% upside or more, Overvalued at -15% or less, otherwise Fairly valued |
 | Research | Filing retrieval, notes, watchlist, optional source-linked AI summaries and assumption suggestions |
 | Exports | Excel model, interactive HTML report, Word memo, PowerPoint briefing |
 
-The data-provider interface lets the models run on supplied data independently
-of the live APIs. The offline checks use a synthetic dividend-paying company
-and a distressed company to exercise the valuation calculations.
+The median keeps one outlying method, such as a DDM on a low-payout stock, from
+dragging the blended target. The data-provider interface lets the models run on
+supplied data independently of the live APIs: `--demo` and the offline checks
+use a synthetic dividend-paying company, and the checks add a distressed company
+to exercise negative equity values.
 
 ## Run the valuation engine
 
-Use Python 3.11 or newer. Run these commands from this directory:
+Use Python 3.11 or newer. Run these commands from this directory. The `--demo`
+run needs no network access or API keys:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+python -m equity_valuation --demo
+```
+
+`--demo` values the synthetic company in `equity_valuation/data/synthetic.py`
+against three synthetic peers and writes `output/SYNT_valuation.xlsx` and
+`output/SYNT_valuation.html`. For a live ticker, set an EDGAR contact first:
+
+```bash
 export SEC_USER_AGENT='equity-research your.email@example.com'
 python -m equity_valuation AAPL --peers MSFT,GOOGL,META,AMZN
 ```
@@ -122,6 +138,31 @@ npm run dev -- --hostname 127.0.0.1
 A macOS Electron wrapper is in [desktop/](desktop/README.md). It uses the local
 project's Python and Node installations; it is not a standalone distribution.
 
+## Results
+
+The offline demo is deterministic, so these figures reproduce exactly with
+`python -m equity_valuation --demo` (the default inputs: risk-free rate 4.2%,
+equity risk premium 5%, five forecast years, 2.5% terminal growth).
+`tests/test_exports.py` pins them. Synthetic Corp has $80B of revenue growing 8%
+a year, a 25% EBIT margin, a 30% payout, $12B of net debt, a beta of 1.1, and a
+share price set at 20x trailing earnings.
+
+| Method | Implied price | vs. $40.84 price |
+| --- | ---: | ---: |
+| DCF (FCFF, WACC 9.5%) | $33.38 | -18.3% |
+| Comps (median of five peer multiples) | $42.88 | +5.0% |
+| DDM | $10.99 | -73.1% |
+| FCFE | $31.25 | -23.5% |
+| **Blended target (median)** | **$32.32** | **-20.9%, Overvalued** |
+
+Terminal value is 73% of the DCF enterprise value. The dashboard's reverse DCF
+(also run in `tests/test_exports.py`) shows why the model calls the stock
+expensive: holding the other inputs fixed, the price implies about 17.5% year-1
+revenue growth fading to terminal, against 8% historical growth. The DDM sits
+far below the other methods because it values only the 30% of earnings paid out
+as dividends, which is the case the median guards against. These are model
+outputs on made-up data, not a forecast or a track record.
+
 ## Offline checks
 
 ```bash
@@ -139,8 +180,10 @@ unittest suite pins the CAPM/WACC, DCF terminal-value, discounting, equity-bridg
 and DDM formulas on the synthetic company, checks the EDGAR annual-series
 normalizer on a hand-built filing payload (restatements, tag changes, 53-week
 years, non-annual forms), and checks settings persistence and local-origin
-restrictions. These checks do not establish live data accuracy or investment
-performance.
+restrictions. The export tests write the Excel, HTML, Word and PowerPoint
+outputs for the synthetic company, confirm the demo figures above, and check
+that the reverse-DCF growth reprices the stock to within one cent. These checks
+do not establish live data accuracy or investment performance.
 
 ## Project layout
 
@@ -149,7 +192,7 @@ equity_valuation/   Data providers, valuation models, CLI, Excel/HTML exporters
 backend/           FastAPI routes, research integration, persistence, exports
 frontend/          Next.js / React dashboard
 desktop/           Electron wrapper for local macOS use
-tests/             Offline model, EDGAR parsing, and settings checks
+tests/             Offline model, EDGAR parsing, export, and settings checks
 ```
 
 This is a local, single-user research tool without authentication. Live data can

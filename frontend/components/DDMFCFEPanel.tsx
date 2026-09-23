@@ -5,7 +5,14 @@
 
 import React from "react";
 import type { Report } from "@/lib/types";
-import { fmtBig, fmtMoney, fmtNum, fmtPct, toneForUpside } from "@/lib/format";
+import {
+  fmtBig,
+  fmtCount,
+  fmtMoney,
+  fmtNum,
+  fmtPct,
+  toneForUpside,
+} from "@/lib/format";
 import { Card, EmptyState, Stat, Table, TD, TH } from "@/components/ui";
 
 // Humanize a snake_case detail key, e.g. "terminal_growth" -> "terminal growth".
@@ -126,7 +133,7 @@ export default function DDMFCFEPanel({ report }: { report: Report }) {
                 label="Equity value"
                 value={fmtBig(fcfe.equity_value, cur)}
               />
-              <Stat label="Shares" value={fmtBig(fcfe.shares)} />
+              <Stat label="Shares" value={fmtCount(fcfe.shares)} />
             </div>
 
             {fcfeYears.length > 0 && (

@@ -5,7 +5,7 @@
 
 import React from "react";
 import type { Report } from "@/lib/types";
-import { fmtBig, fmtDate, fmtPct } from "@/lib/format";
+import { fmtBig, fmtCount, fmtDate, fmtPct } from "@/lib/format";
 import { Card, EmptyState, Stat, Table, TD, TH } from "@/components/ui";
 
 type RowKind = "money" | "shares" | "pct";
@@ -108,7 +108,7 @@ export default function FinancialsPanel({ report }: { report: Report }) {
       case "money":
         return fmtBig(v, cur);
       case "shares":
-        return fmtBig(v);
+        return fmtCount(v);
       case "pct":
         return fmtPct(v, { signed: row.label === "Revenue growth" });
     }
