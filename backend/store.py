@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,36 +22,80 @@ _lock = threading.Lock()
 _MAX_DIGESTS_PER_TICKER = 25
 
 
+class StoreError(RuntimeError):
+    """The store file exists but can't be read or written right now (e.g. a
+    sync client or antivirus holds a lock). Surfaced as HTTP 503; the file is
+    left untouched."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _valid(data) -> bool:
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("watchlist", []), list)
+        and all(isinstance(w, dict) for w in data.get("watchlist", []))
+        and isinstance(data.get("research", {}), dict)
+        and all(isinstance(r, dict) for r in data.get("research", {}).values())
+    )
+
+
+def _quarantine() -> None:
+    """Move an unusable store aside under a name that never overwrites an
+    earlier backup, so the next save can't silently wipe the user's data."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{_STORE_PATH}.corrupt-{stamp}"
+    dest, n = base, 1
+    while os.path.exists(dest):
+        dest, n = f"{base}-{n}", n + 1
+    try:
+        os.replace(_STORE_PATH, dest)
+    except OSError as exc:
+        raise StoreError(f"Research store is unreadable and could not be moved aside: {exc}") from exc
 
 
 def _load() -> dict:
     try:
         with open(_STORE_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            data.setdefault("watchlist", [])
-            data.setdefault("research", {})
-            return data
     except FileNotFoundError:
-        pass
-    except (OSError, json.JSONDecodeError):
-        # Corrupt or unreadable store: preserve it for recovery instead of
-        # letting the next save silently wipe the user's research.
-        try:
-            os.replace(_STORE_PATH, str(_STORE_PATH) + ".corrupt")
-        except OSError:
-            pass
-    return {"watchlist": [], "research": {}}
+        return {"watchlist": [], "research": {}}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Corrupt store: preserve it for recovery, start fresh.
+        _quarantine()
+        return {"watchlist": [], "research": {}}
+    except OSError as exc:
+        # Possibly transient (lock, permissions): don't touch a store that may
+        # be perfectly valid.
+        raise StoreError(f"Research store is temporarily unreadable: {exc}") from exc
+    if not _valid(data):
+        _quarantine()
+        return {"watchlist": [], "research": {}}
+    data.setdefault("watchlist", [])
+    data.setdefault("research", {})
+    return data
 
 
 def _save(data: dict) -> None:
-    os.makedirs(_DATA_DIR, exist_ok=True)
-    tmp = str(_STORE_PATH) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=1)
-    os.replace(tmp, _STORE_PATH)
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(_DATA_DIR), prefix=".copilot_store.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, _STORE_PATH)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise StoreError(f"Could not save the research store: {exc}") from exc
 
 
 # --- watchlist -------------------------------------------------------------- #

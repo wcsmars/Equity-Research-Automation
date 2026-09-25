@@ -171,6 +171,13 @@ _ITEM_PATTERNS = {
 }
 
 
+def _at_line_start(text: str, pos: int) -> bool:
+    """True if a heading match at `pos` begins a line (only whitespace before
+    it on that line). Mid-sentence cross-references ("see Item 1A ...") fail."""
+    before = text[max(0, pos - 2) : pos]
+    return pos == 0 or before.rstrip(" \t") == "" or "\n" in before
+
+
 def extract_sections(text: str, form: str) -> dict[str, str]:
     """Pull the analyst-relevant sections out of a 10-K/10-Q; for short forms
     (8-K etc.) return the whole document capped."""
@@ -188,19 +195,25 @@ def extract_sections(text: str, form: str) -> dict[str, str]:
         # ("see Item 1A. Risk Factors") and TOC entries are then excluded;
         # among line-start matches the LAST one is the section body (the TOC
         # comes first). Fall back to the raw last match if none qualify.
-        line_starts = [
-            s for s in starts if s == 0 or text[max(0, s - 2) : s].rstrip(" \t") == ""
-            or "\n" in text[max(0, s - 2) : s]
-        ]
+        line_starts = [s for s in starts if _at_line_start(text, s)]
         start = (line_starts or starts)[-1]
         # End at the EARLIEST next-item heading across all end patterns —
         # taking the first pattern that matches (in list order) can fold a
-        # later section (e.g. Item 7A) into this one.
+        # later section (e.g. Item 7A) into this one. Like the start, the end
+        # must be a heading at a line start: in-text cross-references ("see
+        # Item 1A", "in Item 8. Financial Statements") would otherwise cut
+        # the section short. Fall back to any match if no heading qualifies.
         end = len(text)
+        loose_end = len(text)
         for ep in end_pats:
-            m = re.search(ep, low[start + 50 :])
-            if m:
-                end = min(end, start + 50 + m.start())
+            for m in re.finditer(ep, low[start + 50 :]):
+                pos = start + 50 + m.start()
+                loose_end = min(loose_end, pos)
+                if _at_line_start(text, pos):
+                    end = min(end, pos)
+                    break
+        if end == len(text):
+            end = loose_end
         chunk = text[start:end].strip()
         if len(chunk) > 500:  # ignore degenerate matches
             sections[key] = chunk[: _SECTION_CAPS.get(key, 50_000)]

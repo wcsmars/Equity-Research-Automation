@@ -10,6 +10,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any, Optional
@@ -21,6 +22,7 @@ from equity_valuation.schemas import (
     DDMAssumptions,
     MacroAssumptions,
 )
+from equity_valuation.utils import is_num
 
 from .serialization import report_to_dict
 
@@ -88,14 +90,41 @@ def _get_provider(ticker: str, refresh: bool = False) -> DataProvider:
     return _CachedProvider(base, company_data)
 
 
+class AssumptionError(ValueError):
+    """An assumption in the request payload is unusable (e.g. NaN/Infinity).
+    The API maps it to HTTP 400 with this message."""
+
+
+def _num(key: str, value: Any) -> Optional[float]:
+    """Coerce one payload value to float. Unparseable values count as 'not
+    given' (the engine default applies); NaN/Infinity and booleans are
+    rejected so they can neither 500 nor silently corrupt the model."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise AssumptionError(f"{key} must be a number, not a boolean.")
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        raise AssumptionError(f"{key} must be a finite number (got {value!r}).")
+    return f
+
+
 def _f(payload: dict, *keys) -> Optional[float]:
     for k in keys:
         if payload.get(k) is not None:
-            try:
-                return float(payload[k])
-            except (TypeError, ValueError):
-                return None
+            return _num(k, payload[k])
     return None
+
+
+def _flag(payload: dict, key: str) -> bool:
+    """Strict-ish boolean toggle: 'false'/'0'/'no'/'off' (any case) are False."""
+    v = payload.get(key, True)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(v)
 
 
 def _revenue_growth_path(
@@ -103,21 +132,17 @@ def _revenue_growth_path(
 ) -> Optional[list[float]]:
     """Build an explicit fading growth path from a near-term (year-1) override
     down to terminal growth, so the AI's 'raise near-term growth' suggestion is
-    directly applicable. Falls back to None (engine derives its own) if no y1."""
+    directly applicable. Falls back to None (engine derives its own) if no y1.
+
+    With a one-year horizon the single forecast year uses y1 itself
+    (utils.fade_path(y1, g, 1) returns [g] by design, which would drop y1)."""
     if y1 is None or forecast_years < 1:
         return None
-    try:
-        from equity_valuation.utils import fade_path
-
-        path = list(fade_path(y1, terminal_growth, forecast_years))
-        if len(path) == forecast_years:
-            return path
-    except Exception:  # noqa: BLE001 - fall through to manual fade
-        pass
     if forecast_years == 1:
         return [y1]
-    step = (terminal_growth - y1) / (forecast_years - 1)
-    return [y1 + step * i for i in range(forecast_years)]
+    from equity_valuation.utils import fade_path
+
+    return list(fade_path(y1, terminal_growth, forecast_years))
 
 
 def parse_assumptions(payload: dict):
@@ -128,10 +153,8 @@ def parse_assumptions(payload: dict):
     erp = _f(payload, "erp", "equity_risk_premium")
     tax = _f(payload, "tax_rate", "tax")
     cod = _f(payload, "cost_of_debt", "pretax_cost_of_debt")
-    try:
-        forecast_years = int(float(payload.get("forecast_years")))
-    except (TypeError, ValueError):
-        forecast_years = _cfg.DEFAULT_FORECAST_YEARS
+    fy = _f(payload, "forecast_years")
+    forecast_years = int(fy) if fy is not None else _cfg.DEFAULT_FORECAST_YEARS
     forecast_years = max(1, min(forecast_years, 15))
     terminal_growth = _f(payload, "terminal_growth")
     if terminal_growth is None:
@@ -143,7 +166,11 @@ def parse_assumptions(payload: dict):
     target_ebit_margin = _f(payload, "target_ebit_margin")
     rev_y1 = _f(payload, "revenue_growth_y1")
     rev_path = payload.get("revenue_growth")
-    if not isinstance(rev_path, list) or not rev_path:
+    if isinstance(rev_path, list) and rev_path:
+        rev_path = [_num("revenue_growth", g) for g in rev_path]
+        if any(g is None for g in rev_path):
+            raise AssumptionError("revenue_growth must be a list of numbers.")
+    else:
         rev_path = _revenue_growth_path(rev_y1, terminal_growth, forecast_years)
 
     macro = MacroAssumptions(
@@ -176,11 +203,8 @@ def parse_assumptions(payload: dict):
         peers = None
 
     toggles = {
-        "run_dcf": payload.get("run_dcf", True),
-        "run_comps": payload.get("run_comps", True),
-        "run_ddm": payload.get("run_ddm", True),
-        "run_fcfe": payload.get("run_fcfe", True),
-        "run_sensitivity": payload.get("run_sensitivity", True),
+        k: _flag(payload, k)
+        for k in ("run_dcf", "run_comps", "run_ddm", "run_fcfe", "run_sensitivity")
     }
 
     echo = {
@@ -228,7 +252,13 @@ def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
 
     This is the 'what do I have to believe?' number: if the market-implied
     growth looks heroic vs history, the price embeds optimism — and vice versa.
-    Pure-math re-runs of the engine's run_dcf on cached data (fast)."""
+    Pure-math re-runs of the engine's run_dcf on cached data (fast).
+
+    The implied price is not guaranteed monotone in growth (e.g. a negative
+    target margin makes extra revenue destroy value), so the range is scanned
+    on a coarse grid and the lowest-growth crossing is bisected. Convergence is
+    judged relative to the price, so penny stocks solve as precisely as $500
+    stocks."""
     import dataclasses as _dc
 
     if report.dcf is None:
@@ -238,8 +268,18 @@ def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
 
         company = report.company
         price = report.current_price
-        if not price or price <= 0:
-            return None
+        base = {
+            "current_assumption_y1": (dcf_assumptions.revenue_growth or [None])[0]
+            if dcf_assumptions.revenue_growth
+            else None,
+        }
+        if not is_num(price) or price <= 0:
+            return {
+                **base,
+                "converged": False,
+                "implied_growth_y1": None,
+                "note": "No valid market price to solve against.",
+            }
 
         def implied(g1: float) -> Optional[float]:
             path = _revenue_growth_path(
@@ -247,41 +287,71 @@ def _reverse_dcf(report, dcf_assumptions, macro) -> Optional[dict]:
             )
             a = _dc.replace(dcf_assumptions, revenue_growth=path)
             try:
-                return _run_dcf(company, macro, a, price).implied_price
+                p = _run_dcf(company, macro, a, price).implied_price
             except Exception:  # noqa: BLE001
                 return None
+            return p if is_num(p) else None
 
-        lo, hi = -0.40, 0.80
-        p_lo, p_hi = implied(lo), implied(hi)
-        base = {
-            "current_assumption_y1": (dcf_assumptions.revenue_growth or [None])[0]
-            if dcf_assumptions.revenue_growth
-            else None,
-        }
-        if p_lo is None or p_hi is None:
+        lo_g, hi_g, step = -0.40, 0.80, 0.05
+        grid = [lo_g + step * i for i in range(round((hi_g - lo_g) / step) + 1)]
+        vals = [implied(g) for g in grid]
+        known = [v for v in vals if v is not None]
+        if not known:
             return None
-        # implied price is monotonically increasing in growth
-        if (p_lo - price) * (p_hi - price) > 0:
+        tol = 1e-9 * price      # stop bisecting once this close
+        accept = 1e-6 * price   # report converged only within 0.0001%
+
+        bracket = None
+        crossings = 0
+        for (g_a, p_a), (g_b, p_b) in zip(zip(grid, vals), zip(grid[1:], vals[1:])):
+            if p_a is None or p_b is None:
+                continue
+            if (p_a - price) * (p_b - price) <= 0 and p_a != p_b:
+                crossings += 1
+                if bracket is None:
+                    bracket = (g_a, p_a, g_b)
+        if bracket is None:
             return {
                 **base,
                 "converged": False,
                 "implied_growth_y1": None,
                 "note": "Market price is outside the solvable growth range "
-                f"({lo:.0%} to {hi:.0%}) with the current assumptions.",
+                f"({lo_g:.0%} to {hi_g:.0%}) with the current assumptions: the "
+                f"model's implied price only spans {min(known):,.2f} to "
+                f"{max(known):,.2f} across that range, vs {price:,.2f}.",
             }
-        mid = (lo + hi) / 2.0
-        for _ in range(48):
+
+        lo, p_lo, hi = bracket
+        mid, p_mid = lo, p_lo
+        for _ in range(60):
+            if abs(p_lo - price) <= tol:
+                mid, p_mid = lo, p_lo
+                break
             mid = (lo + hi) / 2.0
             p_mid = implied(mid)
             if p_mid is None:
                 return None
-            if abs(p_mid - price) < 0.005:
+            if abs(p_mid - price) <= tol:
                 break
             if (p_mid - price) * (p_lo - price) > 0:
                 lo, p_lo = mid, p_mid
             else:
                 hi = mid
-        return {**base, "converged": True, "implied_growth_y1": mid}
+        if abs(p_mid - price) > accept:
+            return {
+                **base,
+                "converged": False,
+                "implied_growth_y1": None,
+                "note": "The implied price jumps across the market price "
+                "instead of passing through it; no growth rate reproduces it.",
+            }
+        out = {**base, "converged": True, "implied_growth_y1": mid}
+        if crossings > 1:
+            out["note"] = (
+                "More than one growth rate reproduces the market price "
+                "with these assumptions; showing the lowest."
+            )
+        return out
     except Exception:  # noqa: BLE001 - diagnostics only, never block valuation
         return None
 

@@ -55,6 +55,18 @@ def _money(x: Optional[float], sym: str = "") -> str:
     return "n/a" if x is None else f"{sym}{x:,.2f}"
 
 
+def _isnum(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _mult(x: Optional[float]) -> str:
+    return f"{x:.1f}x" if _isnum(x) else "n/a"
+
+
+def _dec(x: Optional[float]) -> str:
+    return f"{x:.4g}" if _isnum(x) else "n/a"
+
+
 def _big(x: Optional[float], sym: str = "") -> str:
     """Compact large-number formatter (e.g. 391.0B)."""
     if x is None:
@@ -144,26 +156,65 @@ def build_ai_context(report: dict) -> str:
     )
 
     # DCF drivers (the editable assumptions the user is steering)
+    da = (dcf.get("assumptions") or {}) if dcf else {}
+    rg = da.get("revenue_growth_path") or da.get("revenue_growth")
+    rg = rg if isinstance(rg, list) and rg else None
     if dcf:
         wacc = (dcf.get("wacc") or {})
-        da = dcf.get("assumptions") or {}
+        # The growth the DCF actually used; it clamps the input below WACC.
+        g_req, g_used = da.get("terminal_growth"), da.get("terminal_growth_used")
+        growth = _pct(g_used if g_used is not None else g_req)
+        if g_used is not None and g_req is not None and abs(g_used - g_req) > 1e-12:
+            growth += f" (input {_pct(g_req)}, clamped below WACC)"
         lines.append(
             f"DCF: WACC {_pct(wacc.get('wacc'))} (ke {_pct(wacc.get('cost_of_equity'))}, "
-            f"beta {wacc.get('beta')}), terminal growth {_pct(da.get('terminal_growth'))}, "
+            f"beta {wacc.get('beta')}), terminal growth {growth}, "
             f"terminal method {da.get('terminal_method')}, "
             f"forecast years {da.get('forecast_years')}, "
             f"implied {_money(dcf.get('implied_price'), sym)} ({_pct(dcf.get('upside'))})"
         )
-        rg = da.get("revenue_growth")
-        if isinstance(rg, list) and rg:
+        if rg:
             lines.append(
                 "DCF revenue-growth path: " + ", ".join(_pct(g) for g in rg)
             )
+        lines.append(
+            f"DCF operating drivers: EBIT margin {_pct(da.get('start_ebit_margin'))} "
+            f"fading to target {_pct(da.get('target_ebit_margin'))}, "
+            f"tax rate used {_pct(da.get('tax_rate'))} ({da.get('tax_source') or 'n/a'}), "
+            f"exit EV/EBITDA {_mult(da.get('exit_ev_ebitda'))}"
+        )
+    # macro.tax_rate is None when the engine derives the rate; report the
+    # rate the DCF actually applied instead of "n/a".
+    tax_used = da.get("tax_rate")
+    if tax_used is None:
+        tax_used = macro.get("tax_rate")
     lines.append(
         f"MACRO: risk-free {_pct(macro.get('risk_free_rate'))}, "
         f"ERP {_pct(macro.get('equity_risk_premium'))}, "
-        f"tax {_pct(macro.get('tax_rate'))}"
+        f"tax {_pct(tax_used)}"
     )
+    # The exact current value of every AI-suggestable field, in the units a
+    # suggestion must use, so `current_value` is read rather than guessed.
+    current = {
+        "revenue_growth_y1": rg[0] if rg else None,
+        "terminal_growth": da.get("terminal_growth"),
+        "forecast_years": da.get("forecast_years"),
+        "target_ebit_margin": da.get("target_ebit_margin"),
+        "tax_rate": tax_used,
+        "risk_free_rate": macro.get("risk_free_rate"),
+        "equity_risk_premium": macro.get("equity_risk_premium"),
+        "exit_ev_ebitda": da.get("exit_ev_ebitda"),
+    }
+    lines.append(
+        "CURRENT ASSUMPTION VALUES (decimals): "
+        + ", ".join(f"{k}={_dec(v)}" for k, v in current.items())
+    )
+    rdcf = report.get("reverse_dcf") or {}
+    if rdcf.get("converged") and rdcf.get("implied_growth_y1") is not None:
+        lines.append(
+            "REVERSE DCF: the market price implies year-1 revenue growth of "
+            f"{_pct(rdcf.get('implied_growth_y1'))} (other assumptions held)"
+        )
 
     # Comps snapshot
     if comps:
