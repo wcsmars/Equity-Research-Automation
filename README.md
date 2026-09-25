@@ -1,6 +1,6 @@
 # Equity Research Automation
 
-[![Checks](https://github.com/wcsmars/Equity-Research-Automation/actions/workflows/tests.yml/badge.svg)](https://github.com/wcsmars/Equity-Research-Automation/actions/workflows/tests.yml)
+[![Checks](https://github.com/wcsmars/Equity-Valuation-Engine-with-Reverse-DCF/actions/workflows/tests.yml/badge.svg)](https://github.com/wcsmars/Equity-Valuation-Engine-with-Reverse-DCF/actions/workflows/tests.yml)
 
 An equity valuation engine with a local research dashboard. It combines SEC
 EDGAR fundamentals and Yahoo Finance market data, runs several valuation
@@ -45,7 +45,7 @@ reproducible offline example is under [Results](#results).*
 | Comparables | Peer multiples, outlier trimming, median-based implied prices |
 | DDM / FCFE | Dividend and equity cash-flow valuations discounted at cost of equity |
 | Sensitivity | WACC/growth and margin/growth grids, plus valuation-range comparisons |
-| Decision | Blended target = median of the available DCF, comps-median, DDM and FCFE implied prices; verdict is Undervalued at +15% upside or more, Overvalued at -15% or less, otherwise Fairly valued |
+| Decision | Blended target = median of the available DCF, comps-median, DDM and FCFE implied prices (a method that could not value the company is left out, and a negative equity value counts as zero); verdict is Undervalued at +15% upside or more, Overvalued at -15% or less, otherwise Fairly valued |
 | Research | Filing retrieval, notes, watchlist, optional source-linked AI summaries and assumption suggestions |
 | Exports | Excel model, interactive HTML report, Word memo, PowerPoint briefing |
 
@@ -95,6 +95,10 @@ With no export flag both files are written; `--excel` or `--html` alone writes
 only that format.
 The Excel DCF sheet contains formulas for selected calculations; other model
 outputs are snapshots. The HTML report embeds its chart library for offline use.
+Rates are decimals (`--rf 0.043` means 4.3%); percent-style, non-finite or
+out-of-range values are rejected. `--terminal-growth` applies to the DCF, DDM
+and FCFE. The command exits 1 if the valuation or an export fails and 2 for
+invalid arguments.
 
 ## Run the dashboard
 
@@ -135,25 +139,29 @@ cd frontend
 npm run dev -- --hostname 127.0.0.1
 ```
 
-A macOS Electron wrapper is in [desktop/](desktop/README.md). It uses the local
-project's Python and Node installations; it is not a standalone distribution.
+A macOS Electron wrapper is in [desktop/](desktop/README.md). It runs the
+backend with the project's `.venv` Python. Source runs serve the frontend with
+Electron's bundled Node runtime; a packaged local app uses the Node executable
+captured when it was built (`ERC_NODE_PATH` overrides either). It depends on
+this checkout and is not a standalone distribution.
 
 ## Results
 
 The offline demo is deterministic, so these figures reproduce exactly with
 `python -m equity_valuation --demo` (the default inputs: risk-free rate 4.2%,
 equity risk premium 5%, five forecast years, 2.5% terminal growth).
-`tests/test_exports.py` pins them. Synthetic Corp has $80B of revenue growing 8%
-a year, a 25% EBIT margin, a 30% payout, $12B of net debt, a beta of 1.1, and a
-share price set at 20x trailing earnings.
+`tests/test_exports.py` pins them. Synthetic Corp's revenue grows 8% a year from
+$80B in FY2020 to $108.8B in FY2024, the base year the models value from. It has
+a 25% EBIT margin, a 30% payout, $12B of net debt, a beta of 1.1, and a share
+price set at 20x trailing earnings.
 
 | Method | Implied price | vs. $40.84 price |
 | --- | ---: | ---: |
 | DCF (FCFF, WACC 9.5%) | $33.38 | -18.3% |
 | Comps (median of five peer multiples) | $42.88 | +5.0% |
 | DDM | $10.99 | -73.1% |
-| FCFE | $31.25 | -23.5% |
-| **Blended target (median)** | **$32.32** | **-20.9%, Overvalued** |
+| FCFE | $31.41 | -23.1% |
+| **Blended target (median)** | **$32.40** | **-20.7%, Overvalued** |
 
 Terminal value is 73% of the DCF enterprise value. The dashboard's reverse DCF
 (also run in `tests/test_exports.py`) shows why the model calls the stock
@@ -182,8 +190,12 @@ normalizer on a hand-built filing payload (restatements, tag changes, 53-week
 years, non-annual forms), and checks settings persistence and local-origin
 restrictions. The export tests write the Excel, HTML, Word and PowerPoint
 outputs for the synthetic company, confirm the demo figures above, and check
-that the reverse-DCF growth reprices the stock to within one cent. These checks
-do not establish live data accuracy or investment performance.
+that the reverse-DCF growth reprices the stock to within one cent. Further
+tests cover model edge cases (missing market cap, zero-filled statement lines,
+negative book equity, clamped sensitivity cells), that the Excel formulas
+reconcile to the model, the CLI's input checks, and the API: host checks,
+assumption validation, AI requests against a mocked client, and store recovery.
+These checks do not establish live data accuracy or investment performance.
 
 ## Project layout
 
@@ -192,7 +204,7 @@ equity_valuation/   Data providers, valuation models, CLI, Excel/HTML exporters
 backend/           FastAPI routes, research integration, persistence, exports
 frontend/          Next.js / React dashboard
 desktop/           Electron wrapper for local macOS use
-tests/             Offline model, EDGAR parsing, export, and settings checks
+tests/             Offline model, data, report, export, API, and settings checks
 ```
 
 This is a local, single-user research tool without authentication. Live data can
