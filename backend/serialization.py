@@ -238,6 +238,10 @@ def build_ai_context(report: dict) -> str:
 
     warnings = report.get("warnings") or []
     if warnings:
-        lines.append("MODEL NOTES: " + " | ".join(warnings[:6]))
+        # Data-quality WARNINGs (unconverted currency, no market cap) first, so
+        # the cap never drops them in favour of routine fallback notes.
+        ordered = [w for w in warnings if str(w).startswith("WARNING")] + [
+            w for w in warnings if not str(w).startswith("WARNING")]
+        lines.append("MODEL NOTES: " + " | ".join(str(w) for w in ordered[:10]))
 
     return "\n".join(lines)
