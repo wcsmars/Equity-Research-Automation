@@ -33,22 +33,45 @@ export function apiUrl(path: string): string {
   return `${apiBase()}${path}`;
 }
 
+// Readable message for a failed response. FastAPI sends {"detail": "..."} for
+// HTTPException but a list of {loc, msg, type} objects for 422 validation
+// errors, which would otherwise surface as "[object Object]".
+export async function errorDetail(res: Response): Promise<string> {
+  const fallback = `${res.status} ${res.statusText}`.trim();
+  let d: unknown;
+  try {
+    d = (await res.json())?.detail;
+  } catch {
+    return fallback; // non-JSON body (e.g. a proxy error page)
+  }
+  if (typeof d === "string") return d || fallback;
+  if (Array.isArray(d)) {
+    const msgs = d.map((x) => {
+      if (x && typeof x === "object" && typeof x.msg === "string") {
+        const loc = Array.isArray(x.loc)
+          ? x.loc.filter((p: unknown) => p !== "body").join(".")
+          : "";
+        return loc ? `${loc}: ${x.msg}` : x.msg;
+      }
+      return typeof x === "string" ? x : JSON.stringify(x);
+    });
+    return msgs.join("; ") || fallback;
+  }
+  if (d && typeof d === "object") {
+    const o = d as Record<string, unknown>;
+    const m = o.message ?? o.msg ?? o.detail;
+    return typeof m === "string" && m ? m : JSON.stringify(d);
+  }
+  return d == null ? fallback : String(d);
+}
+
 async function postJSON<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      const j = await res.json();
-      if (j?.detail) detail = j.detail;
-    } catch {
-      /* keep status text */
-    }
-    throw new Error(detail);
-  }
+  if (!res.ok) throw new Error(await errorDetail(res));
   return res.json() as Promise<T>;
 }
 
@@ -102,13 +125,7 @@ export async function postChat(args: {
 // --- filings & transcripts -------------------------------------------------- //
 export async function fetchFilings(ticker: string): Promise<FilingsList> {
   const res = await fetch(apiUrl(`/api/filings/${encodeURIComponent(ticker)}`));
-  if (!res.ok) {
-    let detail = `${res.status}`;
-    try {
-      detail = (await res.json())?.detail ?? detail;
-    } catch {}
-    throw new Error(detail);
-  }
+  if (!res.ok) throw new Error(await errorDetail(res));
   return res.json() as Promise<FilingsList>;
 }
 
@@ -170,6 +187,30 @@ export async function postResearchNote(args: {
 
 export type ExportKind = "excel" | "html" | "memo" | "deck";
 
+// Fallback names match the backend's own (used when the Content-Disposition
+// header isn't readable, e.g. cross-origin in the desktop app).
+const EXPORT_NAMES: Record<ExportKind, string> = {
+  excel: "valuation.xlsx",
+  html: "valuation.html",
+  memo: "research_memo.docx",
+  deck: "briefing.pptx",
+};
+
+function filenameFromDisposition(h: string | null): string | null {
+  if (!h) return null;
+  const star = /filename\*\s*=\s*[\w-]*'[^']*'([^;]+)/i.exec(h);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      /* fall through to the plain filename */
+    }
+  }
+  const plain = /filename\s*=\s*(?:"([^"]+)"|([^;]+))/i.exec(h);
+  const name = (plain?.[1] ?? plain?.[2] ?? "").trim();
+  return name || null;
+}
+
 export async function downloadExport(
   kind: ExportKind,
   ticker: string,
@@ -181,18 +222,13 @@ export async function downloadExport(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ticker, note: note ?? null, ...assumptions }),
   });
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      detail = (await res.json())?.detail ?? detail;
-    } catch {}
-    throw new Error(detail);
-  }
+  if (!res.ok) throw new Error(await errorDetail(res));
   const blob = await res.blob();
-  const ext = { excel: "xlsx", html: "html", memo: "docx", deck: "pptx" }[kind];
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `${ticker}_${kind === "excel" ? "valuation" : kind}.${ext}`;
+  a.download =
+    filenameFromDisposition(res.headers.get("Content-Disposition")) ??
+    `${ticker}_${EXPORT_NAMES[kind]}`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -225,7 +261,9 @@ export async function fetchResearchState(
   const res = await fetch(
     apiUrl(`/api/research_state/${encodeURIComponent(ticker)}`)
   );
-  if (!res.ok) return {};
+  // A never-seen ticker is 200 {}; anything else is a failed read, and must
+  // not look like an empty state (autosave would then wipe the saved one).
+  if (!res.ok) throw new Error(`research state: ${await errorDetail(res)}`);
   return res.json();
 }
 

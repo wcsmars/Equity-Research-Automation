@@ -35,6 +35,8 @@ app.add_middleware(
     allow_origin_regex=r"https?://(?:localhost|127\.0\.0\.1)(?::[0-9]{1,5})?",
     allow_methods=["*"],
     allow_headers=["*"],
+    # Lets the desktop app (cross-origin ?api= mode) read export file names.
+    expose_headers=["Content-Disposition"],
 )
 
 # DNS-rebinding guard. CORS cannot stop a page on a rebound hostname: it is

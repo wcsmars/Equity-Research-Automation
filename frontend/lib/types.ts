@@ -151,8 +151,9 @@ export interface Sensitivity {
   title: string;
   row_label: string;
   col_label: string;
-  row_values: number[];
-  col_values: number[];
+  // Axis values can be null (e.g. the margin axis for a pre-revenue company).
+  row_values: (number | null)[];
+  col_values: (number | null)[];
   grid: (number | null)[][];
 }
 
@@ -168,7 +169,8 @@ export interface Summary {
   name: string;
   currency: string;
   current_price: number;
-  methods: Record<string, number>;
+  methods: Record<string, number | null>;
+  // null when no method produced a usable (positive) value.
   blended_target: number | null;
   blended_upside: number | null;
   recommendation: string;
@@ -235,10 +237,22 @@ export interface Assumptions {
   peers?: string; // comma-separated tickers
 }
 
-export type AssumptionsUsed = Assumptions & {
-  cost_of_debt?: number | null;
-  revenue_growth?: number[] | null;
-};
+// The engine's echo of what it actually used (parse_assumptions). Optional
+// inputs the user left unset come back as null.
+export interface AssumptionsUsed {
+  rf: number;
+  erp: number;
+  tax_rate: number | null;
+  cost_of_debt: number | null;
+  forecast_years: number;
+  terminal_growth: number;
+  terminal_method: "gordon" | "exit_multiple";
+  exit_ev_ebitda: number | null;
+  target_ebit_margin: number | null;
+  revenue_growth_y1: number | null;
+  revenue_growth: number[] | null;
+  peers: string | null;
+}
 
 // --- AI researcher -------------------------------------------------------- //
 export type AssumptionField =

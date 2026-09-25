@@ -113,12 +113,27 @@ export default function DCFPanel({
     { label: "PV of FCFF", cells: (i) => fmtBig(pvf[i], cur) },
   ];
 
+  // The engine deducts minority interest and preferred as well as net debt
+  // (EV − net debt − minority − preferred = equity), so show them when present
+  // or the bridge won't add up.
+  const bs = report.company.balance_sheet;
+  const claim = (v: number | null | undefined) =>
+    typeof v === "number" && Number.isFinite(v) && v !== 0 ? v : null;
+  const minority = claim(bs?.minority_interest);
+  const preferred = claim(bs?.preferred_equity);
+
   const bridge: { label: string; value: React.ReactNode; strong?: boolean }[] = [
     { label: "Sum PV(FCFF)", value: fmtBig(sumPvFcff, cur) },
     { label: "Terminal value", value: fmtBig(dcf.terminal_value, cur) },
     { label: "PV of terminal", value: fmtBig(dcf.pv_terminal, cur) },
     { label: "Enterprise value", value: fmtBig(dcf.enterprise_value, cur), strong: true },
     { label: "(−) Net debt", value: fmtBig(dcf.net_debt, cur) },
+    ...(minority != null
+      ? [{ label: "(−) Minority interest", value: fmtBig(minority, cur) }]
+      : []),
+    ...(preferred != null
+      ? [{ label: "(−) Preferred equity", value: fmtBig(preferred, cur) }]
+      : []),
     { label: "Equity value", value: fmtBig(dcf.equity_value, cur), strong: true },
     { label: "Shares", value: fmtCount(dcf.shares) },
     { label: "Implied price", value: fmtMoney(dcf.implied_price, cur), strong: true },

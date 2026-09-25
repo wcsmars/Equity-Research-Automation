@@ -120,7 +120,10 @@ export default function ValuationSummary({ report }: { report: Report }) {
           </thead>
           <tbody>
             {methods.map(([name, price]) => {
-              const up = s.current_price ? price / s.current_price - 1 : null;
+              const up =
+                price != null && s.current_price
+                  ? price / s.current_price - 1
+                  : null;
               return (
                 <tr key={name}>
                   <TD align="left">{name}</TD>

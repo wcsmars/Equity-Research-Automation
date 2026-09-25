@@ -39,8 +39,8 @@ export function Card({
       )}
     >
       {(title || right) && (
-        <header className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
-          <div>
+        <header className="flex flex-wrap items-start justify-between gap-3 border-b border-line px-4 py-3">
+          <div className="min-w-0">
             {title && (
               <h3 className="text-sm font-semibold tracking-wide text-ink">
                 {title}
@@ -50,7 +50,8 @@ export function Card({
               <p className="mt-0.5 text-xs text-ink-faint">{subtitle}</p>
             )}
           </div>
-          {right && <div className="shrink-0">{right}</div>}
+          {/* Wraps under the title on narrow screens instead of overflowing. */}
+          {right && <div className="min-w-0 max-w-full">{right}</div>}
         </header>
       )}
       <div className={cx("px-4 py-3", bodyClassName)}>{children}</div>

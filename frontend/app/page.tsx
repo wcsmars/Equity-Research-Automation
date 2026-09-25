@@ -15,6 +15,7 @@ import type {
 import {
   apiUrl,
   downloadExport,
+  errorDetail,
   fetchEnrichment,
   fetchResearchState,
   fetchValuation,
@@ -67,7 +68,7 @@ function assumptionsFromUsed(used?: AssumptionsUsed): Assumptions {
     exit_ev_ebitda: used.exit_ev_ebitda ?? undefined,
     target_ebit_margin: used.target_ebit_margin ?? undefined,
     revenue_growth_y1: used.revenue_growth_y1 ?? undefined,
-    peers: used.peers,
+    peers: used.peers ?? undefined,
   };
 }
 
@@ -114,10 +115,16 @@ export default function Home() {
   const [keyAnthropic, setKeyAnthropic] = useState("");
   const [keyFmp, setKeyFmp] = useState("");
   const [savingKeys, setSavingKeys] = useState(false);
+  // Ticker whose saved research couldn't be read (autosave is paused for it).
+  const [restoreFailedFor, setRestoreFailedFor] = useState("");
 
   const autoPeeredFor = useRef<string>("");
+  // Autosave only runs for this ticker: set once its saved research has been
+  // restored and its valuation has loaded, so a switch can never write the
+  // previous ticker's (or a blank) state over the new ticker's saved research.
   const stateLoadedFor = useRef<string>("");
   const loadSeq = useRef(0); // guards against a stale load finishing late
+  const recomputeSeq = useRef(0); // only the newest recompute may land
 
   useEffect(() => {
     // Retry with backoff — in the desktop app the backend can still be
@@ -147,6 +154,8 @@ export default function Home() {
   useEffect(() => {
     watchlistRef.current = watchlist;
   }, [watchlist]);
+  // Set synchronously by loadTicker (not only after render) so async work
+  // started for the previous ticker can tell it has been superseded.
   const tickerRef = useRef("");
   useEffect(() => {
     tickerRef.current = ticker;
@@ -160,16 +169,23 @@ export default function Home() {
     setError(null);
     setReport(null);
     setEnrichment(null);
+    setAssumptions({});
     setResearchNotes("");
     setDigests([]);
     setNote(null);
+    setNoteLoading(false);
+    setRecomputing(false);
+    setRestoreFailedFor("");
     autoPeeredFor.current = "";
     stateLoadedFor.current = "";
+    tickerRef.current = t;
     setTicker(t);
 
     // Restore persisted research FIRST so saved assumptions drive the first
-    // valuation (and saved notes/digests/note come back with it).
+    // valuation (and saved notes/digests/note come back with it). A never-seen
+    // ticker restores as {}; a failed read throws.
     let savedAssumptions: Assumptions = {};
+    let restored = false;
     try {
       const st = await fetchResearchState(t);
       if (seq !== loadSeq.current) return; // a newer load superseded us
@@ -179,10 +195,14 @@ export default function Home() {
       if (st.assumptions && Object.keys(st.assumptions).length > 0) {
         savedAssumptions = st.assumptions;
       }
+      setAssumptions(savedAssumptions);
+      restored = true;
     } catch {
-      /* fresh ticker — nothing persisted yet */
+      if (seq !== loadSeq.current) return;
+      // Value the ticker anyway, but keep autosave off so the blank state
+      // can't overwrite research we merely failed to read.
+      setRestoreFailedFor(t);
     }
-    stateLoadedFor.current = t;
 
     try {
       const rep = await fetchValuation(t, savedAssumptions);
@@ -190,6 +210,7 @@ export default function Home() {
       setReport(rep);
       setAssumptions(assumptionsFromUsed(rep.assumptions_used));
       setTab("Overview");
+      if (restored) stateLoadedFor.current = t;
     } catch (e) {
       if (seq !== loadSeq.current) return;
       setError(e instanceof Error ? e.message : String(e));
@@ -211,17 +232,23 @@ export default function Home() {
 
   const recompute = useCallback(
     async (override?: Assumptions) => {
-      if (!ticker) return;
+      if (!ticker || ticker !== tickerRef.current) return;
       const a = override ?? assumptions;
+      const seq = loadSeq.current;
+      const rseq = ++recomputeSeq.current;
+      // Drop the result if another ticker was loaded or a newer recompute
+      // started meanwhile — it would overwrite the newer report.
+      const current = () =>
+        seq === loadSeq.current && rseq === recomputeSeq.current;
       setRecomputing(true);
       setError(null);
       try {
         const rep = await fetchValuation(ticker, a);
-        setReport(rep);
+        if (current()) setReport(rep);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        if (current()) setError(e instanceof Error ? e.message : String(e));
       } finally {
-        setRecomputing(false);
+        if (current()) setRecomputing(false);
       }
     },
     [ticker, assumptions]
@@ -241,7 +268,8 @@ export default function Home() {
     }
   }, [report, enrichment, ticker, assumptions, recompute]);
 
-  // Autosave research state (debounced) once the initial load has happened.
+  // Autosave research state (debounced), only once this ticker's saved state
+  // was restored and its valuation loaded (see stateLoadedFor).
   useEffect(() => {
     if (!ticker || stateLoadedFor.current !== ticker) return;
     const id = setTimeout(() => {
@@ -308,8 +336,13 @@ export default function Home() {
     [ticker]
   );
 
+  // A note takes about a minute. If another ticker was loaded meanwhile,
+  // don't show it on that ticker's page; save it to its own ticker instead
+  // (or show it if its ticker has been reloaded and restored since).
   const generateNote = useCallback(async () => {
-    if (!report) return;
+    if (!report || !ticker) return;
+    const seq = loadSeq.current;
+    const t = ticker;
     setNoteLoading(true);
     setError(null);
     try {
@@ -317,28 +350,41 @@ export default function Home() {
         report,
         extra_context: researchNotes,
       });
-      setNote(n);
+      if (
+        seq === loadSeq.current ||
+        (tickerRef.current === t && stateLoadedFor.current === t)
+      )
+        setNote(n);
+      else saveResearchState(t, { note: n }).catch(() => {});
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (seq === loadSeq.current)
+        setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setNoteLoading(false);
+      if (seq === loadSeq.current) setNoteLoading(false);
     }
-  }, [report, researchNotes]);
+  }, [report, researchNotes, ticker]);
 
+  // Export the inputs of the valuation on screen, not slider moves that
+  // haven't been recomputed yet, so the file matches the dashboard.
   const handleExport = useCallback(
     async (kind: ExportKind) => {
-      if (!ticker || exporting !== null) return; // no concurrent exports
+      if (!ticker || !report || exporting !== null) return; // no concurrent exports
       setExporting(kind);
       setError(null);
       try {
-        await downloadExport(kind, ticker, assumptions, note);
+        await downloadExport(
+          kind,
+          ticker,
+          assumptionsFromUsed(report.assumptions_used),
+          note
+        );
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
         setExporting(null);
       }
     },
-    [ticker, assumptions, note, exporting]
+    [ticker, report, note, exporting]
   );
 
   const watching = watchlist.some((w) => w.ticker === ticker);
@@ -443,19 +489,23 @@ export default function Home() {
                   fmp_api_key: keyFmp || null,
                 }),
               });
-              if (!res.ok)
-                throw new Error((await res.json())?.detail ?? `${res.status}`);
+              if (!res.ok) throw new Error(await errorDetail(res));
               setStatus(await res.json());
               setKeyAnthropic("");
               setKeyFmp("");
               setShowKeys(false);
               // FMP just connected: refresh enrichment for the loaded ticker.
               if (ticker) {
+                const seq = loadSeq.current;
                 setEnrichLoading(true);
                 fetchEnrichment(ticker)
-                  .then(setEnrichment)
+                  .then((en) => {
+                    if (seq === loadSeq.current) setEnrichment(en);
+                  })
                   .catch(() => {})
-                  .finally(() => setEnrichLoading(false));
+                  .finally(() => {
+                    if (seq === loadSeq.current) setEnrichLoading(false);
+                  });
               }
             } catch (err2) {
               setError(err2 instanceof Error ? err2.message : String(err2));
@@ -677,6 +727,13 @@ export default function Home() {
             </div>
           </div>
 
+          {restoreFailedFor === ticker && (
+            <div className="mt-3 rounded-lg border border-flat/40 bg-flat/10 px-4 py-2 text-xs text-flat">
+              Couldn&apos;t load the saved research for {ticker}, so autosave is
+              paused to avoid overwriting it. Load the ticker again to retry.
+            </div>
+          )}
+
           {/* Tabs */}
           <div className="mt-4 flex flex-wrap gap-1 border-b border-line">
             {TABS.map((t) => (
@@ -737,6 +794,7 @@ export default function Home() {
                 report={report}
                 extraContext={researchNotes}
                 aiEnabled={status?.anthropic_enabled ?? false}
+                fmpEnabled={status?.fmp_enabled ?? false}
                 onDigested={onDigested}
               />
             </div>
