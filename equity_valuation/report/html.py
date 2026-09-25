@@ -102,7 +102,9 @@ def _upside_class(upside: Optional[float]) -> str:
 #  Figure builders (each returns an HTML fragment or '' when not applicable)
 # --------------------------------------------------------------------------- #
 # We track whether plotly.js has already been embedded so only the FIRST figure
-# carries the library. ``_PlotEmbedder`` keeps that state local to one render.
+# carries the library. ``_PlotEmbedder`` keeps that state local to one render:
+# write_html creates one per call and hands it to every figure builder, so
+# concurrent renders (the backend exports from request threads) never share it.
 class _PlotEmbedder:
     """Serializes plotly figures, embedding plotly.js exactly once."""
 
@@ -121,7 +123,8 @@ class _PlotEmbedder:
         return frag
 
 
-def _football_field_fig(report: ValuationReport, symbol: str) -> str:
+def _football_field_fig(report: ValuationReport, symbol: str,
+                        embed: _PlotEmbedder) -> str:
     """Horizontal floating bars (low->high) with a base marker and a current-price line."""
     rows = [r for r in (report.football_field or []) if r is not None]
     # Keep only rows with at least a usable low/high span.
@@ -202,10 +205,10 @@ def _football_field_fig(report: ValuationReport, symbol: str) -> str:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.update_xaxes(showgrid=True, gridcolor="#eee", zeroline=False)
-    return _EMBED.to_html(fig)
+    return embed.to_html(fig)
 
 
-def _fcff_fig(report: ValuationReport, symbol: str) -> str:
+def _fcff_fig(report: ValuationReport, symbol: str, embed: _PlotEmbedder) -> str:
     """Bar chart of projected FCFF by forecast year."""
     dcf = report.dcf
     if dcf is None:
@@ -222,7 +225,7 @@ def _fcff_fig(report: ValuationReport, symbol: str) -> str:
             x=xs,
             y=ys,
             marker=dict(color="#2e8b8b"),
-            hovertemplate="FY %{x}<br>FCFF: " + symbol + "%{y:,.0f}<extra></extra>",
+            hovertemplate="Year %{x}<br>FCFF: " + symbol + "%{y:,.0f}<extra></extra>",
         )
     )
     fig.update_layout(
@@ -236,10 +239,10 @@ def _fcff_fig(report: ValuationReport, symbol: str) -> str:
         font=dict(family="Segoe UI, Helvetica, Arial, sans-serif", size=13),
     )
     fig.update_yaxes(showgrid=True, gridcolor="#eee", zeroline=True, zerolinecolor="#ccc")
-    return _EMBED.to_html(fig)
+    return embed.to_html(fig)
 
 
-def _comps_fig(report: ValuationReport) -> str:
+def _comps_fig(report: ValuationReport, embed: _PlotEmbedder) -> str:
     """Bar chart of each peer's EV/EBITDA against the target's EV/EBITDA."""
     comps = report.comps
     if comps is None:
@@ -261,8 +264,11 @@ def _comps_fig(report: ValuationReport) -> str:
         values.append(float(target_mult))
         colors.append("#c0392b")
 
-    # Peer median reference line.
-    med = median(values[:len(peers)]) if peers else None
+    # Peer median reference line: the comps model's (outlier-trimmed) median,
+    # which is what the stats table and the implied prices use.
+    med = ((getattr(comps, "stats", None) or {}).get("ev_ebitda") or {}).get("median")
+    if not is_num(med):
+        med = median(values[:len(peers)]) if peers else None
 
     fig = go.Figure(
         go.Bar(
@@ -290,10 +296,11 @@ def _comps_fig(report: ValuationReport) -> str:
         font=dict(family="Segoe UI, Helvetica, Arial, sans-serif", size=13),
     )
     fig.update_yaxes(showgrid=True, gridcolor="#eee", zeroline=False)
-    return _EMBED.to_html(fig)
+    return embed.to_html(fig)
 
 
-def _sensitivity_figs(report: ValuationReport, symbol: str) -> list[str]:
+def _sensitivity_figs(report: ValuationReport, symbol: str,
+                      embed: _PlotEmbedder) -> list[str]:
     """One heatmap per SensitivityResult (implied price across the grid)."""
     frags: list[str] = []
     for sens in (report.sensitivities or []):
@@ -342,7 +349,7 @@ def _sensitivity_figs(report: ValuationReport, symbol: str) -> list[str]:
         )
         # Keep rows top-to-bottom in the order provided.
         fig.update_yaxes(autorange="reversed")
-        frags.append(_EMBED.to_html(fig))
+        frags.append(embed.to_html(fig))
     return frags
 
 
@@ -411,13 +418,22 @@ def _dcf_table(report: ValuationReport, symbol: str) -> str:
         f"{header}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
     )
 
-    # Value bridge (EV -> equity -> per share).
+    # Value bridge (EV -> equity -> per share). The model subtracts every senior
+    # claim, so show minority interest and preferred equity next to net debt.
+    bs = getattr(getattr(report, "company", None), "balance_sheet", None)
+
+    def _claim(attr: str) -> float:
+        v = getattr(bs, attr, None) if bs is not None else None
+        return float(v) if is_num(v) else 0.0
+
     bridge_items = [
         ("Sum PV of FCFF", _fmt_big(sum(v for v in pv if is_num(v)), symbol)),
         ("Terminal value (undiscounted)", _fmt_big(getattr(dcf, "terminal_value", None), symbol)),
         ("PV of terminal value", _fmt_big(getattr(dcf, "pv_terminal", None), symbol)),
         ("Enterprise value", _fmt_big(getattr(dcf, "enterprise_value", None), symbol)),
         ("Less: net debt", _fmt_big(getattr(dcf, "net_debt", None), symbol)),
+        ("Less: minority interest", _fmt_big(_claim("minority_interest"), symbol)),
+        ("Less: preferred equity", _fmt_big(_claim("preferred_equity"), symbol)),
         ("Equity value", _fmt_big(getattr(dcf, "equity_value", None), symbol)),
         ("Shares", _fmt_big(getattr(dcf, "shares", None))),
         ("Implied price", _fmt_price(getattr(dcf, "implied_price", None), symbol)),
@@ -544,25 +560,25 @@ def _blended_target(report: ValuationReport) -> tuple[Optional[float], Optional[
     """(blended target, upside). Prefer report.summary; else median of FF bases."""
     summary = report.summary or {}
     # Source the header's blended target from report.summary so it matches the
-    # Excel Summary sheet; prefer the canonical 'blended_target' key, then accept
-    # a few alternative spellings the engine might populate.
+    # Excel Summary sheet and the CLI. A None there means no method produced a
+    # usable price: show n/a rather than inventing a target.
     target = None
-    for key in ("blended_target", "target_price", "blended", "target", "fair_value"):
-        if is_num(summary.get(key)):
-            target = float(summary[key])
-            break
-    if target is None:
-        # Fall back to the football-field median only when summary is absent.
-        bases = [getattr(r, "base", None) for r in (report.football_field or [])]
+    if "blended_target" in summary:
+        if is_num(summary.get("blended_target")):
+            target = float(summary["blended_target"])
+    else:
+        # No engine summary at all: fall back to the median of the valuation
+        # methods' football-field bases. The 52-week row is market data (its
+        # base is the current price), not a valuation, so it is excluded.
+        bases = [getattr(r, "base", None) for r in (report.football_field or [])
+                 if "52-w" not in str(getattr(r, "method", "") or "").lower()]
         target = median([b for b in bases if is_num(b)])
 
-    # Likewise prefer the summary's blended upside (canonical key first) so the
-    # header agrees with the Excel Summary sheet.
+    # Likewise take the summary's blended upside so the header agrees with the
+    # Excel Summary sheet.
     upside = None
-    for key in ("blended_upside", "upside"):
-        if is_num(summary.get(key)):
-            upside = float(summary[key])
-            break
+    if target is not None and is_num(summary.get("blended_upside")):
+        upside = float(summary["blended_upside"])
     if upside is None and is_num(target) and is_num(report.current_price) and report.current_price:
         upside = target / report.current_price - 1.0
     return target, upside
@@ -592,7 +608,29 @@ def _header_html(report: ValuationReport, symbol: str) -> str:
         f"<h1>{name}</h1>"
         f"<div class='subtitle'>{sub}</div>"
         f"<div class='cards'>{cards_html}</div>"
-        "</header>"
+        + _methods_table(report, symbol)
+        + "</header>"
+    )
+
+
+def _methods_table(report: ValuationReport, symbol: str) -> str:
+    """Each method's implied price and upside: the inputs to the blended target."""
+    methods = (report.summary or {}).get("methods") or {}
+    if not methods:
+        return ""
+    cur = report.current_price
+    rows = []
+    for name, price in methods.items():
+        up = (price / cur - 1.0) if (is_num(price) and is_num(cur) and cur) else None
+        rows.append(
+            f"<tr><th class='rowhead'>{_esc(name)}</th>"
+            f"<td>{_fmt_price(price, symbol)}</td>"
+            f"<td class='{_upside_class(up)}'>{_fmt_pct(up)}</td></tr>"
+        )
+    return (
+        "<h3 class='subhead'>Valuation by method</h3>"
+        "<table class='kv methods'><thead><tr><th></th><th>Implied price</th>"
+        "<th>Upside</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
     )
 
 
@@ -702,6 +740,8 @@ table.grid tr.stat-row td { background:#f3f7fb; font-style:italic; color:var(--m
 table.kv { width:auto; min-width:280px; }
 table.kv th.rowhead { text-align:left; padding:5px 14px 5px 0; color:var(--muted); font-weight:600; }
 table.kv td { text-align:right; padding:5px 0; font-weight:600; }
+table.kv.methods td { padding-left:18px; }
+table.kv.methods thead th { text-align:right; color:var(--muted); font-size:12px; font-weight:600; padding-left:18px; }
 .bridge { margin-top:14px; }
 .pos { color:var(--pos); }
 .neg { color:var(--neg); }
@@ -736,11 +776,6 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-# Module-level embedder reference; reset at the start of every render so each call
-# to write_html embeds plotly.js exactly once for its own document.
-_EMBED = _PlotEmbedder()
-
-
 def _section(title: str, *fragments: str) -> str:
     """Wrap non-empty fragments in a titled section card; '' if all empty."""
     body = "".join(f for f in fragments if f)
@@ -757,8 +792,7 @@ def write_html(report: ValuationReport, path: str) -> str:
     or empty, the corresponding section is simply omitted. The function never
     raises on missing fields — it degrades to ``n/a`` cells and skipped sections.
     """
-    global _EMBED
-    _EMBED = _PlotEmbedder()  # fresh per-render embed state (plotly.js once)
+    embed = _PlotEmbedder()  # per-render embed state (plotly.js once per document)
 
     # Resolve the currency symbol from the company's market data.
     market = getattr(getattr(report, "company", None), "market", None)
@@ -769,21 +803,21 @@ def write_html(report: ValuationReport, path: str) -> str:
     header = _header_html(report, symbol)
 
     # --- Football field (always its own section when data exists) --------- #
-    ff_fig = _football_field_fig(report, symbol)
+    ff_fig = _football_field_fig(report, symbol, embed)
     football = _section("Valuation summary", ff_fig) if ff_fig else ""
 
     # --- DCF -------------------------------------------------------------- #
     dcf_table = _dcf_table(report, symbol)
-    dcf_chart = _fcff_fig(report, symbol)
+    dcf_chart = _fcff_fig(report, symbol, embed)
     dcf_section = _section("Discounted cash flow (DCF)", dcf_table, dcf_chart)
 
     # --- Comps ------------------------------------------------------------ #
     comps_table = _comps_table(report, symbol)
-    comps_chart = _comps_fig(report)
+    comps_chart = _comps_fig(report, embed)
     comps_section = _section("Trading comparables", comps_table, comps_chart)
 
     # --- Sensitivities ---------------------------------------------------- #
-    sens_figs = _sensitivity_figs(report, symbol)
+    sens_figs = _sensitivity_figs(report, symbol, embed)
     sens_section = _section("Sensitivity analysis", *sens_figs) if sens_figs else ""
 
     # --- Footnotes / assumptions / warnings ------------------------------- #

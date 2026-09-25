@@ -23,6 +23,7 @@ import datetime as _dt
 from typing import Optional
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
@@ -64,6 +65,10 @@ def _set(ws: Worksheet, row: int, col: int, value: object,
          *, fmt: Optional[str] = None, font: Optional[Font] = None,
          align: Optional[Alignment] = None) -> "Cell":  # type: ignore[name-defined]
     """Write a value into (row, col) and apply optional number format / style."""
+    if isinstance(value, str):
+        # Control characters (e.g. from exception text in a warning) are illegal
+        # in XLSX XML and would make openpyxl refuse to write the whole file.
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
     cell = ws.cell(row=row, column=col, value=value)
     if fmt is not None:
         cell.number_format = fmt
@@ -111,7 +116,7 @@ def _money_fmt(report: ValuationReport) -> str:
 # (rendered as a percent). Everything else -- d0, dps, *_pv, *_value, price,
 # stage PVs -- is money.
 _RATE_KEY_TOKENS = (
-    "growth", "rate", "ke", "coe", "roe", "retention", "yield", "wacc",
+    "growth", "rate", "ke", "coe", "roe", "retention", "yield", "wacc", "cost_of",
 )
 
 
@@ -121,6 +126,41 @@ def _is_rate_key(key: object) -> bool:
     if name == "g" or name.endswith("_g"):
         return True
     return any(tok in name for tok in _RATE_KEY_TOKENS)
+
+
+def _is_years_key(key: object) -> bool:
+    """True if a detail key's NAME is a horizon in years (e.g. high_growth_years)."""
+    name = str(key).lower()
+    return name.endswith("years") or name == "h_half"
+
+
+def _detail_fmt(key: object, value: float, money_fmt: str) -> str:
+    """Number format for one numeric model-detail entry, chosen by key name."""
+    if _is_years_key(key):
+        return "0" if float(value).is_integer() else "0.0"
+    return PERCENT_FMT if _is_rate_key(key) else money_fmt
+
+
+def _year_labels(report: ValuationReport, years: list) -> list[str]:
+    """Column headers for a projection table.
+
+    Calendar years render as "FY 2025". Relative indices (the DCF numbers its
+    forecast 1..n from the latest fiscal year) are mapped onto that fiscal year
+    when it is known, so the DCF and FCFE tables label the same periods alike;
+    otherwise they render as "Year 1".
+    """
+    fin = getattr(report.company, "financials", None)
+    fys = [int(y) for y in (getattr(fin, "fiscal_years", None) or []) if is_num(y)]
+    last_fy = fys[-1] if fys else None
+    labels = []
+    for y in years:
+        if is_num(y) and y >= 1000:
+            labels.append(f"FY {int(y)}")
+        elif is_num(y) and last_fy is not None:
+            labels.append(f"FY {last_fy + int(y)}")
+        else:
+            labels.append(f"Year {y}")
+    return labels
 
 
 # --------------------------------------------------------------------------- #
@@ -167,15 +207,14 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
         imp = _num(implied)
         _set(ws, row, 1, label)
         _set(ws, row, 2, imp, fmt=money_fmt, align=_RIGHT)
-        if imp is not None and cur_price is not None:
+        if imp is not None and cur_price:
             # Live upside formula referencing the implied-price cell and current price.
             up_cell = _set(ws, row, 3, f"=B{row}/{current_price_cell}-1",
                            fmt=PERCENT_FMT, align=_RIGHT)
             # Best-effort sign coloring (Excel won't recolor on edit; this is the
             # value as-computed now -- a "plus", per the contract).
-            up_val = (imp / cur_price - 1.0) if cur_price else None
-            if up_val is not None:
-                up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
+            up_val = imp / cur_price - 1.0
+            up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
         else:
             _set(ws, row, 3, "n/a", align=_RIGHT)
         row += 1
@@ -194,11 +233,13 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     _method_line("FCFE", getattr(fcfe, "implied_price", None) if fcfe else None)
 
     # Blended target: prefer the engine-computed value on report.summary so the
-    # Excel and HTML headline targets always agree; fall back to the local
-    # median-of-methods only when that key is absent.
+    # Excel and HTML headline targets always agree (a None there means "no
+    # usable method" and stays blank); fall back to the local median-of-methods
+    # only when that key is absent.
     summary = getattr(report, "summary", None) or {}
-    blended = _num(summary.get("blended_target")) if "blended_target" in summary else None
-    if blended is None:
+    if "blended_target" in summary:
+        blended = _num(summary.get("blended_target"))
+    else:
         method_prices = [
             _num(getattr(dcf, "implied_price", None) if dcf else None),
             _num(comps_med),
@@ -209,7 +250,7 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
     _set(ws, row, 1, "Blended target (median)", font=_LABEL_FONT)
     blended_cell = _set(ws, row, 2, _num(blended), fmt=money_fmt, align=_RIGHT)
     blended_cell.font = _LABEL_FONT
-    if blended is not None and cur_price is not None:
+    if blended is not None and cur_price:
         up_cell = _set(ws, row, 3, f"=B{row}/{current_price_cell}-1",
                        fmt=PERCENT_FMT, align=_RIGHT)
         # Prefer the engine-computed blended_upside for sign-coloring (keeps the
@@ -217,7 +258,7 @@ def _write_summary(ws: Worksheet, report: ValuationReport, money_fmt: str) -> No
         if "blended_upside" in summary:
             up_val = _num(summary.get("blended_upside"))
         else:
-            up_val = blended / cur_price - 1.0 if cur_price else None
+            up_val = blended / cur_price - 1.0
         if up_val is not None:
             up_cell.font = _GREEN_FONT if up_val >= 0 else _RED_FONT
     row += 2
@@ -325,7 +366,7 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
 
     # Header: metric label column + one column per forecast year.
     _header_row(ws, table_top, ["(values in reporting currency)"]
-                + [f"FY {y}" for y in years])
+                + _year_labels(report, years))
     # Column index of the first data year (column 2 = "B").
     first_year_col = 2
 
@@ -349,7 +390,9 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
         else:
             prev = get_column_letter(col - 1)
             cur = get_column_letter(col)
-            _set(ws, r_growth, col, f"={cur}{r_rev}/{prev}{r_rev}-1",
+            # Guarded: the model projects zero revenue when it has no base.
+            _set(ws, r_growth, col,
+                 f'=IF({prev}{r_rev}=0,"",{cur}{r_rev}/{prev}{r_rev}-1)',
                  fmt=PERCENT_FMT, align=_RIGHT)
 
     r_ebit = body + 2
@@ -359,7 +402,8 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     _set(ws, r_margin, 1, "  EBIT margin %", font=_LABEL_FONT)
     for j in range(n):
         col = get_column_letter(first_year_col + j)
-        _set(ws, r_margin, first_year_col + j, f"={col}{r_ebit}/{col}{r_rev}",
+        _set(ws, r_margin, first_year_col + j,
+             f'=IF({col}{r_rev}=0,"",{col}{r_ebit}/{col}{r_rev})',
              fmt=PERCENT_FMT, align=_RIGHT)
 
     r_nopat = body + 4
@@ -442,9 +486,22 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
     net_debt_cell = f"B{row}"
     row += 1
 
-    # Equity value = EV - net debt  (LIVE formula).
+    # The model bridges EV to common equity through every senior claim, not just
+    # net debt (models/dcf.py): minority interest and preferred equity too.
+    bs = getattr(report.company, "balance_sheet", None)
+    claim_cells = []
+    for label, attr in (("Less: minority interest", "minority_interest"),
+                        ("Less: preferred equity", "preferred_equity")):
+        claim = _num(getattr(bs, attr, None)) if bs is not None else None
+        _set(ws, row, 1, label, font=_LABEL_FONT)
+        _set(ws, row, 2, claim if claim is not None else 0.0, fmt=money_fmt, align=_RIGHT)
+        claim_cells.append(f"B{row}")
+        row += 1
+
+    # Equity value = EV - net debt - minority - preferred  (LIVE formula).
     _set(ws, row, 1, "Equity value", font=_LABEL_FONT)
-    _set(ws, row, 2, f"={ev_cell}-{net_debt_cell}", fmt=money_fmt, align=_RIGHT)
+    _set(ws, row, 2, f"={ev_cell}-{net_debt_cell}-" + "-".join(claim_cells),
+         fmt=money_fmt, align=_RIGHT)
     equity_cell = f"B{row}"
     row += 1
 
@@ -629,8 +686,17 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
                     # Classify by KEY NAME, not magnitude: a $0.96 dividend or an
                     # $0.85 per-share PV must not render as "96.0%"/"85.0%". Only
                     # keys whose name signals a rate get the percent mask.
-                    fmt = PERCENT_FMT if _is_rate_key(key) else money_fmt
-                    _set(ws, row, 2, float(val), fmt=fmt, align=_RIGHT)
+                    _set(ws, row, 2, float(val), fmt=_detail_fmt(key, val, money_fmt),
+                         align=_RIGHT)
+                elif isinstance(val, (list, tuple)) and val and all(is_num(v) for v in val):
+                    # Per-year series (dividends, stage PVs): one value per column.
+                    for j, v in enumerate(val):
+                        _set(ws, row, 2 + j, float(v),
+                             fmt=_detail_fmt(key, v, money_fmt), align=_RIGHT)
+                elif isinstance(val, (list, tuple)):
+                    # Text lists (notes): readable text, not a Python repr.
+                    text = "; ".join(str(v) for v in val) if val else "none"
+                    _set(ws, row, 2, text, align=_RIGHT)
                 else:
                     _set(ws, row, 2, str(val), align=_RIGHT)
                 row += 1
@@ -655,7 +721,7 @@ def _write_ddm_fcfe(ws: Worksheet, report: ValuationReport, money_fmt: str) -> N
     pv_series = list(getattr(fcfe, "pv_fcfe", []) or [])
 
     # Projection table: metrics as rows, forecast years as columns.
-    _header_row(ws, row, ["(reporting currency)"] + [f"FY {y}" for y in years])
+    _header_row(ws, row, ["(reporting currency)"] + _year_labels(report, years))
     table_top = row
     first_col = 2
     row += 1
@@ -815,8 +881,9 @@ def write_excel(report: ValuationReport, path: str) -> str:
     Sheets: Summary, DCF, Comps, DDM_FCFE, Sensitivity. Every model section is
     guarded against being None and degrades to a human-readable "not available"
     note. Live Excel formulas are used where practical (PV = FCFF*DF,
-    EV = SUM(PVs)+PV_TV, equity = EV - net debt, implied = equity/shares,
-    upside = implied/current - 1) so the workbook recalculates on user edits.
+    EV = SUM(PVs)+PV_TV, equity = EV - net debt - minority interest - preferred
+    equity, implied = equity/shares, upside = implied/current - 1) so the
+    workbook recalculates on user edits.
     """
     money_fmt = _money_fmt(report)
 
@@ -830,11 +897,17 @@ def write_excel(report: ValuationReport, path: str) -> str:
     ws_sens = wb.create_sheet("Sensitivity")
 
     # Each writer is independently guarded; one bad section must not sink the file.
-    _write_summary(ws_summary, report, money_fmt)
-    _write_dcf(ws_dcf, report, money_fmt)
-    _write_comps(ws_comps, report, money_fmt)
-    _write_ddm_fcfe(ws_ddm, report, money_fmt)
-    _write_sensitivity(ws_sens, report, money_fmt)
+    for writer, ws in (
+        (_write_summary, ws_summary),
+        (_write_dcf, ws_dcf),
+        (_write_comps, ws_comps),
+        (_write_ddm_fcfe, ws_ddm),
+        (_write_sensitivity, ws_sens),
+    ):
+        try:
+            writer(ws, report, money_fmt)
+        except Exception as exc:  # noqa: BLE001 - degrade to a note on that sheet
+            _note(ws, ws.max_row + 2, f"This section could not be written: {exc}")
 
     wb.save(path)
     return path
