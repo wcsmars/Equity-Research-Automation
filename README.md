@@ -208,7 +208,9 @@ tests/             Offline model, data, report, export, API, and settings checks
 ```
 
 This is a local, single-user research tool without authentication. Live data can
-be missing, stale, or rate-limited, and foreign-company coverage is less complete.
+be missing, stale, or rate-limited, and foreign-company coverage is less complete:
+filers EDGAR cannot serve use yfinance statements, converted to the quote
+currency at one spot rate (or flagged in the warnings when no rate is available).
 Default macro inputs are illustrative assumptions rather than current market
 estimates; with them, the five-year Gordon-growth DCF is deliberately
 conservative and tends to flag mega-cap growth names as overvalued, so use the

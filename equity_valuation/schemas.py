@@ -5,14 +5,18 @@ single source of truth for field names and units, so DO NOT redefine or rename
 fields in other modules -- import them from here.
 
 UNIT CONVENTIONS (read carefully):
-  * All monetary amounts are in the company's reporting currency, in *absolute*
-    units (NOT millions). e.g. revenue of 391_035_000_000.0 for AAPL FY2024.
+  * All monetary amounts are in the quote currency (`MarketData.currency`, major
+    unit), in *absolute* units (NOT millions), e.g. revenue of
+    391_035_000_000.0 for AAPL FY2024. Statements reported in another currency
+    are converted at one spot rate by the provider, or flagged with a WARNING
+    note when no rate is available.
   * Share counts are absolute (e.g. 15_300_000_000.0 shares), never millions.
   * Per-share values are in currency units per share.
   * Rates / percentages are decimals: 8% -> 0.08, never 8.0.
-  * `capex`, `dep_amort`, `change_in_nwc`, `dividends_paid`, `interest_expense`,
-    `tax_expense` are stored as POSITIVE magnitudes (a cash outflow for capex is
-    stored as +X, the models apply the sign).
+  * `capex`, `dep_amort`, `change_in_nwc`, `dividends_paid`, `interest_expense`
+    are stored as POSITIVE magnitudes (a cash outflow for capex is stored as +X,
+    the models apply the sign). `tax_expense` keeps its sign: a tax benefit is
+    negative.
   * Annual series (lists) are ordered OLDEST -> NEWEST. The last element is the
     most recent fiscal year and aligns with `BalanceSheetSnapshot`.
 """
@@ -39,7 +43,7 @@ class AnnualFinancials:
     capex: list[float]              # capital expenditures (positive magnitude)
     change_in_nwc: list[float]      # increase in net working capital (positive = cash use)
     interest_expense: list[float]   # gross interest expense (positive)
-    tax_expense: list[float]        # income-tax expense (positive)
+    tax_expense: list[float]        # income-tax expense (a tax benefit is negative)
     pretax_income: list[float]      # pre-tax income (EBT)
     dividends_paid: list[float]     # total common dividends paid (positive magnitude)
     diluted_shares: list[float]     # weighted-average diluted shares
@@ -75,7 +79,7 @@ class MarketData:
     shares_outstanding: float
     market_cap: float
     beta: Optional[float] = None
-    dividend_per_share: Optional[float] = None          # trailing annual DPS
+    dividend_per_share: Optional[float] = None          # indicated annual DPS (D0)
     fifty_two_week_low: Optional[float] = None
     fifty_two_week_high: Optional[float] = None
     sector: Optional[str] = None

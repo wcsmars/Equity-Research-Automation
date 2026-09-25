@@ -1,10 +1,24 @@
 """Live market data + trading-comps multiples via yfinance.
 
 `YFinanceClient` supplies the *market* side of the world (price, market cap, beta,
-trailing dividend, 52-week range, sector/industry) and the trailing valuation
+annual dividend, 52-week range, sector/industry) and the trailing valuation
 multiples used by the comps model. It can also, as a fallback, reconstruct a rough
 `AnnualFinancials` + `BalanceSheetSnapshot` from yfinance's statement DataFrames
 for non-US issuers that SEC EDGAR cannot serve.
+
+Currencies
+----------
+* Market data is returned in the MAJOR unit of the quote currency: Yahoo quotes
+  London, Johannesburg and Tel Aviv listings in pence / cents / agorot (``GBp``,
+  ``ZAc``, ``ILA``), which are converted to GBP / ZAR / ILS.
+* yfinance statements are in the issuer's reporting currency
+  (``info['financialCurrency']``), e.g. TWD for the USD-quoted TSM ADR. The
+  fallback converts them into the quote currency at one spot FX rate (a Yahoo
+  ``XXXYYY=X`` quote) so price and fundamentals are comparable; if no rate can
+  be fetched it leaves them unconverted and adds a prominent WARNING note.
+* Data-quality notes ride on the returned objects as a ``_source_notes``
+  attribute (MarketData, and the fallback's AnnualFinancials); HybridProvider
+  copies them into ``CompanyData.source_notes``.
 
 Design notes
 ------------
@@ -23,6 +37,8 @@ Design notes
 
 from __future__ import annotations
 
+import dataclasses
+import math
 from typing import Optional
 
 from ..schemas import (
@@ -33,6 +49,29 @@ from ..schemas import (
 )
 from ..utils import is_num
 from .base import DataError
+
+# Yahoo quote currencies expressed in minor units -> (major ISO code, factor).
+_MINOR_UNITS = {
+    "GBp": ("GBP", 0.01),
+    "GBX": ("GBP", 0.01),
+    "ZAc": ("ZAR", 0.01),
+    "ILA": ("ILS", 0.01),
+}
+
+# sharesOutstanding more than this far from marketCap/price is on a different
+# share basis (one class of a multi-class issuer, or ordinary shares vs ADSs).
+_SHARE_MISMATCH_TOL = 0.05
+
+# Monetary fields scaled by an FX conversion (share counts and years are not).
+_MONEY_SERIES = (
+    "revenue", "ebit", "ebitda", "net_income", "dep_amort", "capex",
+    "change_in_nwc", "interest_expense", "tax_expense", "pretax_income",
+    "dividends_paid",
+)
+_MONEY_BALANCE = (
+    "total_debt", "cash_and_investments", "total_equity", "minority_interest",
+    "preferred_equity",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -75,6 +114,60 @@ def _str(x: object) -> Optional[str]:
     return s or None
 
 
+def major_currency(code: Optional[str]) -> tuple[Optional[str], float]:
+    """``(major ISO code, factor)`` for a Yahoo currency code.
+
+    ``GBp`` (pence) -> ``('GBP', 0.01)``, ``ZAc`` -> ``('ZAR', 0.01)``,
+    ``ILA`` -> ``('ILS', 0.01)``; anything else is already a major unit and is
+    returned upper-cased with factor 1.0. The minor codes are case-sensitive
+    (``GBp`` is pence, ``GBP`` is pounds).
+    """
+    s = _str(code)
+    if s is None:
+        return None, 1.0
+    if s in _MINOR_UNITS:
+        return _MINOR_UNITS[s]
+    return s.upper(), 1.0
+
+
+def _unit_scale(ratio_if_minor: Optional[float], factor: float) -> float:
+    """Multiplier that takes a Yahoo amount to the MAJOR currency unit.
+
+    For a minor-unit quote (``factor`` 0.01) Yahoo is not consistent about
+    whether derived fields (market cap, dividend rate) are in the minor or the
+    major unit. `ratio_if_minor` compares the amount with the same quantity
+    rebuilt from the minor-unit price: ~1 means it is in minor units (scale by
+    `factor`), ~`factor` means it is already major (scale 1.0). The closer
+    reading wins; without a comparison the amount is taken to be in the quote's
+    own (minor) unit.
+    """
+    if factor == 1.0 or ratio_if_minor is None or not ratio_if_minor > 0:
+        return factor
+    if abs(math.log(ratio_if_minor / factor)) < abs(math.log(ratio_if_minor)):
+        return 1.0
+    return factor
+
+
+def scale_fundamentals(
+    financials: AnnualFinancials, balance_sheet: BalanceSheetSnapshot, rate: float
+) -> tuple[AnnualFinancials, BalanceSheetSnapshot]:
+    """Copies of the fundamentals with every monetary amount multiplied by `rate`.
+
+    Used for FX conversion: all flow series and balance-sheet amounts are
+    scaled; fiscal years and share counts are not. Dynamic attributes (e.g.
+    ``_source_notes``) are not carried over.
+    """
+    fin = dataclasses.replace(
+        financials,
+        **{k: [v * rate for v in getattr(financials, k)] for k in _MONEY_SERIES},
+    )
+    bs = dataclasses.replace(
+        balance_sheet,
+        **{k: getattr(balance_sheet, k) * rate for k in _MONEY_BALANCE},
+    )
+    return fin, bs
+
+
 class YFinanceClient:
     """Thin, defensive wrapper around yfinance for market data and comps."""
 
@@ -99,11 +192,13 @@ class YFinanceClient:
             return {}
         return info if isinstance(info, dict) else {}
 
-    def _fast_last_price(self, tk) -> Optional[float]:
-        """Pull a last price from `fast_info` (a lighter, more reliable endpoint).
+    def _fast_value(self, tk, keys: tuple[str, ...], coerce=_pos):
+        """First usable `fast_info` field among `keys` (e.g. last_price, shares).
 
         `fast_info` supports both attribute and mapping access depending on the
-        yfinance version, so we try both. Any failure -> None.
+        yfinance version, so we try both; `coerce` validates each candidate.
+        `fast_info` is a lighter endpoint (price history) than `.info`, so it
+        often still works when `.info` is rate-limited. Any failure -> None.
         """
         fi = None
         try:
@@ -113,22 +208,67 @@ class YFinanceClient:
         if fi is None:
             return None
         # Try attribute access first, then mapping-style access.
-        for key in ("last_price", "lastPrice"):
+        for key in keys:
             try:
-                val = getattr(fi, key)
+                val = coerce(getattr(fi, key))
             except Exception:
                 val = None
-            price = _pos(val)
-            if price is not None:
-                return price
-        for key in ("last_price", "lastPrice"):
+            if val is not None:
+                return val
+        for key in keys:
             try:
-                val = fi[key]  # type: ignore[index]
+                val = coerce(fi[key])  # type: ignore[index]
             except Exception:
                 val = None
-            price = _pos(val)
-            if price is not None:
-                return price
+            if val is not None:
+                return val
+        return None
+
+    def _fast_last_price(self, tk) -> Optional[float]:
+        """Pull a last price from `fast_info`, or None."""
+        return self._fast_value(tk, ("last_price", "lastPrice"))
+
+    def _quote_currency(self, tk, info: dict) -> Optional[str]:
+        """Raw Yahoo quote currency: ``info['currency']``, else fast_info's."""
+        return _str(info.get("currency")) or self._fast_value(tk, ("currency",), _str)
+
+    # ----------------------------------------------------------------- #
+    #  Public: spot FX rate (never raises).
+    # ----------------------------------------------------------------- #
+    def get_fx_rate(self, from_ccy: str, to_ccy: str) -> Optional[tuple[float, str]]:
+        """Spot units of `to_ccy` per one `from_ccy`, plus the quote(s) used.
+
+        Tries Yahoo's direct pair (``TWDUSD=X``), then the inverse pair
+        (``1/USDTWD=X``), then a cross through USD. Returns None when no
+        positive rate can be obtained. Never raises.
+        """
+        f, t = (_str(from_ccy) or "").upper(), (_str(to_ccy) or "").upper()
+        if not f or not t:
+            return None
+        if f == t:
+            return 1.0, "same currency"
+        hit = self._fx_pair(f, t)
+        if hit is not None:
+            return hit
+        if "USD" not in (f, t):
+            a, b = self._fx_pair(f, "USD"), self._fx_pair("USD", t)
+            if a is not None and b is not None:
+                return a[0] * b[0], f"{a[1]} x {b[1]}"
+        return None
+
+    def _fx_pair(self, f: str, t: str) -> Optional[tuple[float, str]]:
+        """`t` per one `f` from the direct Yahoo pair or its inverse, or None."""
+        for sym, invert in ((f"{f}{t}=X", False), (f"{t}{f}=X", True)):
+            try:
+                tk = self._ticker(sym)
+            except Exception:
+                continue
+            px = self._fast_last_price(tk)
+            if px is None:
+                info = self._info(tk)
+                px = _pos(info.get("regularMarketPrice")) or _pos(info.get("previousClose"))
+            if px is not None:
+                return (1.0 / px, f"1/{sym}") if invert else (px, sym)
         return None
 
     # ----------------------------------------------------------------- #
@@ -139,14 +279,23 @@ class YFinanceClient:
 
         Field mapping (first non-None wins):
           price              <- info.currentPrice -> fast_info.last_price -> previousClose
-          shares_outstanding <- info.sharesOutstanding
+          shares_outstanding <- info.sharesOutstanding -> fast_info.shares, replaced by
+                                marketCap/price when they differ by >5% (multi-class
+                                issuers / ADRs report one class or ordinary shares)
           market_cap         <- info.marketCap (fallback price * shares)
           beta               <- info.beta
-          dividend_per_share <- info.dividendRate -> trailingAnnualDividendRate
+          dividend_per_share <- info.dividendRate (indicated annual rate, used as D0)
+                                -> trailingAnnualDividendRate
           52wk low/high      <- info.fiftyTwoWeekLow / fiftyTwoWeekHigh
           sector/industry    <- info.sector / industry
-          currency           <- info.currency (default 'USD')
+          currency           <- info.currency -> fast_info.currency (default 'USD'),
+                                minor units (GBp/ZAc/ILA) converted to the major unit
           name               <- info.longName -> shortName -> ticker
+
+        When neither a share count nor a market cap is available both are left
+        at 0.0 (the schema types them as float); the hybrid provider backfills
+        them from the statements, with a note, or warns. Data-quality notes are
+        attached as ``_source_notes`` on the returned object.
 
         Raises :class:`DataError` if no price can be obtained.
         """
@@ -158,6 +307,12 @@ class YFinanceClient:
             ) from exc
 
         info = self._info(tk)
+        notes: list[str] = []
+        if not info:
+            notes.append(
+                "Yahoo quote summary (.info) unavailable; market data limited to "
+                "the price endpoint (no beta, dividend or 52-week range from Yahoo)"
+            )
 
         # --- price: try .info fields, then the lighter fast_info endpoint ---- #
         price = _pos(info.get("currentPrice"))
@@ -173,34 +328,75 @@ class YFinanceClient:
                 "returned no usable price field)."
             )
 
+        # --- currency: convert minor-unit quotes (pence etc.) to major ------ #
+        quote_ccy = self._quote_currency(tk, info)
+        if quote_ccy is None:
+            quote_ccy = "USD"
+            notes.append("quote currency unavailable from Yahoo; assumed USD")
+        currency, unit = major_currency(quote_ccy)
+        if unit != 1.0:
+            notes.append(
+                f"Yahoo quotes {ticker.upper()} in {quote_ccy} ({currency} minor "
+                f"units); price, 52-week range and dividend converted to {currency}"
+            )
+        price_quote = price  # in the quote's own (possibly minor) unit
+        price = price_quote * unit
+
         # --- shares & market cap (with mutual fallbacks) --------------------- #
         shares = _pos(info.get("sharesOutstanding"))
-        market_cap = _pos(info.get("marketCap"))
-        if market_cap is None and shares is not None:
+        mcap_raw = _pos(info.get("marketCap"))
+        if shares is None and mcap_raw is None:
+            shares = self._fast_value(tk, ("shares",))
+        market_cap: Optional[float] = None
+        if mcap_raw is not None:
+            ratio = mcap_raw / (price_quote * shares) if shares is not None else None
+            market_cap = mcap_raw * _unit_scale(ratio, unit)
+            implied = market_cap / price
+            if shares is None:
+                # Back out an implied share count so per-share math works.
+                shares = implied
+            elif abs(implied / shares - 1.0) > _SHARE_MISMATCH_TOL:
+                # Multi-class issuers (GOOGL, BRK-B) report one class's shares
+                # and ADRs sometimes ordinary shares, while marketCap covers the
+                # whole company on the quoted line's basis.
+                notes.append(
+                    f"sharesOutstanding ({shares:,.0f}) differs from marketCap/price "
+                    f"({implied:,.0f}); using marketCap/price (multi-class or ADR "
+                    "share basis)"
+                )
+                shares = implied
+        elif shares is not None:
             market_cap = price * shares
-        if shares is None and market_cap is not None:
-            # Back out an implied share count so downstream per-share math works.
-            shares = market_cap / price
-        # Final guards: never leave these as None on the dataclass (which types
-        # them as float). Use sane zero-ish fallbacks and let the engine warn.
-        if shares is None:
-            shares = 0.0
-        if market_cap is None:
-            market_cap = price * shares  # 0.0 if shares unknown
+        # The dataclass types these as float: when neither is known leave 0.0;
+        # HybridProvider backfills them from the statements (with a note) or
+        # adds a WARNING that the market cap is unavailable.
+        if shares is None or market_cap is None:
+            shares, market_cap = 0.0, 0.0
 
-        # --- dividend per share (trailing annual) --------------------------- #
+        # --- dividend per share -------------------------------------------- #
+        # Yahoo's dividendRate is the indicated (current annualized) dividend,
+        # used as D0 by the DDM; trailingAnnualDividendRate (TTM) only fills in
+        # when it is missing, since TTM lags cuts and includes specials.
         dps = _num(info.get("dividendRate"))
         if dps is None:
             dps = _num(info.get("trailingAnnualDividendRate"))
+        if dps is not None and unit != 1.0:
+            # Disambiguate the dividend's unit with the unitless trailing yield.
+            yld = _pos(info.get("trailingAnnualDividendYield"))
+            ratio = dps / (yld * price_quote) if yld is not None else None
+            dps = dps * _unit_scale(ratio, unit)
+
+        def _px(key: str) -> Optional[float]:
+            v = _num(info.get(key))
+            return v * unit if v is not None else None
 
         name = (
             _str(info.get("longName"))
             or _str(info.get("shortName"))
             or ticker.upper()
         )
-        currency = _str(info.get("currency")) or "USD"
 
-        return MarketData(
+        md = MarketData(
             ticker=ticker.upper(),
             name=name,
             currency=currency,
@@ -209,11 +405,13 @@ class YFinanceClient:
             market_cap=market_cap,
             beta=_num(info.get("beta")),
             dividend_per_share=dps,
-            fifty_two_week_low=_num(info.get("fiftyTwoWeekLow")),
-            fifty_two_week_high=_num(info.get("fiftyTwoWeekHigh")),
+            fifty_two_week_low=_px("fiftyTwoWeekLow"),
+            fifty_two_week_high=_px("fiftyTwoWeekHigh"),
             sector=_str(info.get("sector")),
             industry=_str(info.get("industry")),
         )
+        md._source_notes = notes  # type: ignore[attr-defined]
+        return md
 
     # ----------------------------------------------------------------- #
     #  Public: a single comps row (never raises).
@@ -309,40 +507,17 @@ class YFinanceClient:
     #  Public: best-effort peer suggestions (yfinance has no robust API).
     # ----------------------------------------------------------------- #
     def suggest_peers(self, ticker: str) -> list[str]:
-        """Best-effort peer tickers for ``ticker``.
+        """Best-effort peer tickers for ``ticker``: always ``[]``.
 
-        yfinance exposes no reliable, stable peer/screener API across versions, so
-        this is intentionally conservative: we never fabricate peers from a sector
-        string (that would require an external universe). Returns ``[]`` so the
-        caller (the comps model / engine) can decide how to source peers. Never
-        raises.
+        yfinance exposes no peer/screener data: none of the modules its `.info`
+        requests (financialData, quoteType, defaultKeyStatistics, assetProfile,
+        summaryDetail, the v7 quote) carries a related-tickers field. We never
+        fabricate peers from a sector string either, so peers must be passed
+        explicitly (README: "Peers are not auto-discovered"). Returning without
+        a network call matters because the comps model asks on every
+        (cached) recompute. Never raises.
         """
-        try:
-            tk = self._ticker(ticker)
-        except Exception:
-            return []
-
-        # Some yfinance versions expose `.recommendations`-style related symbols or
-        # a `get_recommendations` for sustainability/upgrades — none are reliable
-        # peer lists. We only opportunistically read an explicit related-companies
-        # field if a future/forked yfinance provides one, and otherwise return [].
-        info = self._info(tk)
-        peers: list[str] = []
-        seen: set[str] = set()
-        self_sym = ticker.upper()
-        for key in ("relatedTickers", "peerSet", "peers"):
-            raw = info.get(key)
-            if isinstance(raw, (list, tuple)):
-                for item in raw:
-                    sym = _str(item)
-                    if not sym:
-                        continue
-                    up = sym.upper()
-                    if up == self_sym or up in seen:
-                        continue
-                    seen.add(up)
-                    peers.append(sym)
-        return peers
+        return []
 
     # ----------------------------------------------------------------- #
     #  Public: fundamentals fallback from yfinance statement DataFrames.
@@ -355,8 +530,18 @@ class YFinanceClient:
         Parses ``Ticker(...).financials`` (income statement), ``.cashflow`` and
         ``.balance_sheet`` — pandas DataFrames whose COLUMNS are period-end
         Timestamps ordered NEWEST-first. We reverse them to OLDEST->NEWEST to match
-        the package's series convention, and align all series to the common set of
-        fiscal years present on the income statement.
+        the package's series convention, and keep only the periods where the
+        income statement has both revenue and net income (yfinance often adds a
+        sparse oldest column), mirroring the EDGAR year axis. Each line takes,
+        per period, the first candidate row with a value; lines still missing
+        are zero-filled and noted.
+
+        Statements are in the issuer's reporting currency
+        (``info['financialCurrency']``); when that differs from the quote
+        currency they are converted at one spot FX rate (see
+        :meth:`get_fx_rate`), or left unconverted with a WARNING note if no rate
+        is available. Notes ride on the returned financials as
+        ``_source_notes``.
 
         Used by the hybrid provider to backfill non-US issuers that EDGAR cannot
         serve. Returns ``None`` on any failure (missing dep, empty frames, no
@@ -376,12 +561,33 @@ class YFinanceClient:
         if income is None or income.empty:
             return None
 
+        notes: list[str] = []
+        rev_names = ("Total Revenue", "TotalRevenue", "Operating Revenue", "OperatingRevenue")
+        ni_names = ("Net Income", "NetIncome", "Net Income Common Stockholders")
+
         # Period-end columns, oldest -> newest. yfinance gives newest-first.
         cols = list(income.columns)
         try:
             cols = sorted(cols)  # Timestamps sort chronologically -> oldest first
         except Exception:
             cols = list(reversed(cols))  # fall back to a simple reversal
+
+        # Keep periods with revenue, and with net income too where that line
+        # exists at all (a sparse oldest column otherwise enters the history
+        # as a year of real revenue with zero EBIT, capex, shares, ...).
+        with_rev = [c for c in cols if self._cell(income, rev_names, c) is not None]
+        both = [c for c in with_rev if self._cell(income, ni_names, c) is not None]
+        kept = both or with_rev
+        if not kept:
+            return None  # no revenue anywhere: nothing to value
+        dropped = [c for c in cols if c not in kept]
+        if dropped:
+            notes.append(
+                "yfinance fallback: dropped "
+                + ", ".join(self._date_iso(c) for c in dropped)
+                + " (period without both revenue and net income)"
+            )
+        cols = kept
 
         # Derive fiscal years from the column timestamps (period-end year).
         fiscal_years: list[int] = []
@@ -390,107 +596,120 @@ class YFinanceClient:
             fiscal_years.append(yr if yr is not None else 0)
 
         # --- helper to pull a row series aligned to `cols` (oldest->newest) --- #
-        def series(df, names: tuple[str, ...], *, positive: bool = False) -> list[float]:
-            """Return the first matching row across `names`, aligned to `cols`.
+        def series(
+            sources: list[tuple[object, tuple[str, ...]]],
+            *,
+            positive: bool = False,
+            label: str = "",
+        ) -> list[float]:
+            """Per period, the first candidate row (across `sources`) with a value.
 
-            Missing values -> 0.0; if `positive`, store the absolute magnitude
-            (yfinance reports capex / dividends / D&A with varying signs).
+            Missing values -> 0.0 (noted when `label` is given); if `positive`,
+            store the absolute magnitude (yfinance reports capex / dividends /
+            D&A with varying signs).
             """
-            if df is None:
-                return [0.0] * len(cols)
-            row = self._row(df, names)
-            if row is None:
-                return [0.0] * len(cols)
             out: list[float] = []
-            for c in cols:
-                val = _num(row.get(c)) if hasattr(row, "get") else None
+            missing: list[int] = []
+            for c, fy in zip(cols, fiscal_years):
+                val = None
+                for df, names in sources:
+                    val = self._cell(df, names, c)
+                    if val is not None:
+                        break
                 if val is None:
                     out.append(0.0)
+                    missing.append(fy)
                 else:
                     out.append(abs(val) if positive else val)
+            if label and missing:
+                if len(missing) == len(cols):
+                    notes.append(f"yfinance fallback: {label} unavailable; filled with 0.0")
+                else:
+                    notes.append(
+                        f"yfinance fallback: {label} missing for "
+                        + ", ".join(f"FY{y}" for y in missing)
+                        + "; filled with 0.0"
+                    )
             return out
 
         # --- income-statement driven series --------------------------------- #
-        revenue = series(
-            income,
-            ("Total Revenue", "TotalRevenue", "Operating Revenue", "OperatingRevenue"),
+        revenue = series([(income, rev_names)])
+        # Operating income first: Yahoo's 'EBIT' row is pretax income + interest
+        # expense (non-operating items included), so it is only a last resort
+        # (e.g. banks with no operating-income line), matching EDGAR's basis.
+        ebit = series(
+            [(income, ("Operating Income", "OperatingIncome",
+                       "Total Operating Income As Reported", "EBIT"))],
+            label="EBIT (operating income)",
         )
-        # Bail out if revenue is entirely empty/zero — nothing to value.
-        if not any(v != 0.0 for v in revenue):
-            return None
-
-        ebit = series(income, ("EBIT", "Operating Income", "OperatingIncome"))
-        net_income = series(
-            income, ("Net Income", "NetIncome", "Net Income Common Stockholders")
+        net_income = series([(income, ni_names)])
+        pretax_income = series(
+            [(income, ("Pretax Income", "PretaxIncome", "Income Before Tax"))],
+            label="pretax income",
         )
-        pretax_income = series(income, ("Pretax Income", "PretaxIncome", "Income Before Tax"))
+        # Signed: a tax benefit stays negative (the effective-tax median needs it).
         tax_expense = series(
-            income, ("Tax Provision", "TaxProvision", "Income Tax Expense"), positive=True
+            [(income, ("Tax Provision", "TaxProvision", "Income Tax Expense"))],
+            label="tax expense",
         )
         interest_expense = series(
-            income, ("Interest Expense", "InterestExpense"), positive=True
+            [(income, ("Interest Expense", "InterestExpense",
+                       "Interest Expense Non Operating"))],
+            positive=True,
         )
 
         # D&A: prefer the income statement, then the cash-flow statement.
         dep_amort = series(
-            income,
-            (
-                "Reconciled Depreciation",
-                "Depreciation And Amortization In Income Statement",
-                "Depreciation Amortization Depletion Income Statement",
-            ),
-            positive=True,
-        )
-        if not any(v != 0.0 for v in dep_amort):
-            dep_amort = series(
-                cashflow,
-                (
+            [
+                (income, (
+                    "Reconciled Depreciation",
+                    "Depreciation And Amortization In Income Statement",
+                    "Depreciation Amortization Depletion Income Statement",
+                )),
+                (cashflow, (
                     "Depreciation And Amortization",
                     "DepreciationAndAmortization",
                     "Depreciation Amortization Depletion",
                     "Depreciation",
-                ),
-                positive=True,
-            )
+                )),
+            ],
+            positive=True,
+            label="D&A",
+        )
 
         # EBITDA = EBIT + D&A (per the package convention; never looked up).
         ebitda = [e + d for e, d in zip(ebit, dep_amort)]
 
         # --- cash-flow driven series ---------------------------------------- #
         capex = series(
-            cashflow,
-            ("Capital Expenditure", "CapitalExpenditure", "Purchase Of PPE"),
+            [(cashflow, ("Capital Expenditure", "CapitalExpenditure", "Purchase Of PPE"))],
             positive=True,
+            label="capex",
         )
         dividends_paid = series(
-            cashflow,
-            (
+            [(cashflow, (
                 "Cash Dividends Paid",
                 "Common Stock Dividend Paid",
                 "CommonStockDividendPaid",
                 "Dividends Paid",
-            ),
+            ))],
             positive=True,
         )
         # ΔNWC: yfinance's "Change In Working Capital" is signed as a cash-flow
         # contribution (a NWC *increase* is a cash *use* -> negative). Our schema
         # stores ΔNWC as positive = increase in NWC, so negate the cash-flow sign.
-        cf_wc = series(
-            cashflow,
-            ("Change In Working Capital", "ChangeInWorkingCapital"),
-        )
+        cf_wc = series([(cashflow, ("Change In Working Capital", "ChangeInWorkingCapital"))])
         change_in_nwc = [-v for v in cf_wc]
 
-        # Diluted shares (weighted average) — fall back to basic, then market cap
-        # is irrelevant here so leave 0.0 if truly absent.
+        # Diluted shares (weighted average), falling back to basic per period.
         diluted_shares = series(
-            income,
-            (
+            [(income, (
                 "Diluted Average Shares",
                 "DilutedAverageShares",
                 "Basic Average Shares",
                 "BasicAverageShares",
-            ),
+            ))],
+            label="diluted shares",
         )
 
         financials = AnnualFinancials(
@@ -509,20 +728,72 @@ class YFinanceClient:
             diluted_shares=diluted_shares,
         )
 
-        balance_sheet = self._build_balance_sheet(balance)
+        balance_sheet = self._build_balance_sheet(balance, notes)
 
+        # Reporting currency -> quote currency (FX notes lead the list).
+        fx_notes: list[str] = []
+        financials, balance_sheet = self._to_quote_currency(
+            tk, financials, balance_sheet, fx_notes
+        )
+        financials._source_notes = fx_notes + notes  # type: ignore[attr-defined]
         return financials, balance_sheet
+
+    def _to_quote_currency(
+        self,
+        tk,
+        financials: AnnualFinancials,
+        balance_sheet: BalanceSheetSnapshot,
+        notes: list[str],
+    ) -> tuple[AnnualFinancials, BalanceSheetSnapshot]:
+        """Convert fallback statements into the quote currency's major unit.
+
+        One spot rate for every year: the DCF, FCFE and comps are linear in the
+        monetary inputs, so this equals valuing in the reporting currency and
+        converting at spot, and the WACC weights need debt and market cap in the
+        same currency. If no rate can be fetched the statements are returned
+        unconverted with a WARNING note (currencies are never mixed silently).
+        """
+        info = self._info(tk)
+        fin_ccy, fin_unit = major_currency(info.get("financialCurrency"))
+        quote_ccy, _ = major_currency(self._quote_currency(tk, info))
+        if fin_ccy is None or quote_ccy is None:
+            notes.append(
+                "yfinance fallback: reporting or quote currency unavailable from "
+                "Yahoo; statements assumed to be in the quote currency"
+            )
+            return financials, balance_sheet
+        if fin_ccy == quote_ccy and fin_unit == 1.0:
+            return financials, balance_sheet
+        fx = self.get_fx_rate(fin_ccy, quote_ccy)
+        if fx is None:
+            notes.append(
+                f"WARNING: financial statements are in {fin_ccy} but the share "
+                f"price is in {quote_ccy}, and no {fin_ccy}->{quote_ccy} exchange "
+                "rate could be fetched; statements were NOT converted, so DCF, "
+                "FCFE and comps per-share values are not comparable with the price"
+            )
+            return financials, balance_sheet
+        rate, how = fx
+        notes.append(
+            f"Fundamentals converted from {fin_ccy} to {quote_ccy} at spot "
+            f"{rate:.6g} ({how}); every year uses this one rate"
+        )
+        return scale_fundamentals(financials, balance_sheet, rate * fin_unit)
 
     # ----------------------------------------------------------------- #
     #  Balance-sheet snapshot assembly (most recent period).
     # ----------------------------------------------------------------- #
-    def _build_balance_sheet(self, balance) -> BalanceSheetSnapshot:
+    def _build_balance_sheet(
+        self, balance, notes: Optional[list[str]] = None
+    ) -> BalanceSheetSnapshot:
         """Build a :class:`BalanceSheetSnapshot` from the newest balance-sheet column.
 
-        Always returns a snapshot (zero-filled if data is missing) so the caller
-        gets a usable object; the DCF/WACC models tolerate zero debt/cash.
+        Always returns a snapshot (zero-filled if data is missing, with a note
+        in `notes`) so the caller gets a usable object.
         """
+        notes = notes if notes is not None else []
         if balance is None or getattr(balance, "empty", True):
+            notes.append("yfinance fallback: balance sheet unavailable; debt, cash and equity set to 0.0")
             return BalanceSheetSnapshot(
                 as_of="",
                 total_debt=0.0,
@@ -538,43 +809,51 @@ class YFinanceClient:
         as_of = self._date_iso(col)
 
         def val(names: tuple[str, ...]) -> Optional[float]:
-            row = self._row(balance, names)
-            if row is None:
-                return None
-            try:
-                return _num(row.get(col)) if hasattr(row, "get") else None
-            except Exception:
-                return None
+            return self._cell(balance, names, col)
 
         # Total debt: prefer an explicit total, else sum LT + current debt.
         total_debt = val(("Total Debt", "TotalDebt"))
         if total_debt is None:
-            lt = val(("Long Term Debt", "LongTermDebt")) or 0.0
-            cur = val(
-                ("Current Debt", "CurrentDebt", "Short Term Debt", "ShortTermDebt")
-            ) or 0.0
-            total_debt = lt + cur
+            lt = val(("Long Term Debt And Capital Lease Obligation", "Long Term Debt", "LongTermDebt"))
+            cur = val((
+                "Current Debt And Capital Lease Obligation", "Current Debt",
+                "CurrentDebt", "Short Term Debt", "ShortTermDebt",
+            ))
+            if lt is None and cur is None:
+                notes.append("yfinance fallback: total debt unavailable; set to 0.0")
+            total_debt = (lt or 0.0) + (cur or 0.0)
 
-        # Cash + short-term investments.
-        cash = val(
-            ("Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash Cash Equivalents And Short Term Investments")
-        ) or 0.0
-        sti = val(("Short Term Investments", "Other Short Term Investments")) or 0.0
-        # If the combined "...And Short Term Investments" line was used, avoid
-        # double counting: only add sti when the pure-cash line was found.
-        cash_and_investments = cash + sti
+        # Cash + short-term investments. The combined line already includes the
+        # short-term investments, so use it alone; otherwise add the parts.
+        combined = val(("Cash Cash Equivalents And Short Term Investments",
+                        "CashCashEquivalentsAndShortTermInvestments"))
+        if combined is not None:
+            cash_and_investments = combined
+        else:
+            cash = val(("Cash And Cash Equivalents", "CashAndCashEquivalents"))
+            sti = val(("Other Short Term Investments", "Short Term Investments"))
+            if cash is None and sti is None:
+                notes.append("yfinance fallback: cash & equivalents unavailable; set to 0.0")
+            cash_and_investments = (cash or 0.0) + (sti or 0.0)
 
-        total_equity = val(
-            ("Stockholders Equity", "StockholdersEquity", "Total Equity Gross Minority Interest", "Common Stock Equity")
-        ) or 0.0
         minority = val(("Minority Interest", "MinorityInterest")) or 0.0
         preferred = val(("Preferred Stock", "PreferredStock", "Preferred Securities Outside Stock Equity")) or 0.0
+
+        # Book equity attributable to the parent (as on EDGAR). The gross line
+        # includes noncontrolling interests, so strip them if it is all we have.
+        total_equity = val(("Stockholders Equity", "StockholdersEquity", "Common Stock Equity"))
+        if total_equity is None:
+            gross = val(("Total Equity Gross Minority Interest",))
+            if gross is not None:
+                total_equity = gross - minority
+            else:
+                notes.append("yfinance fallback: total equity unavailable; set to 0.0")
 
         return BalanceSheetSnapshot(
             as_of=as_of,
             total_debt=float(total_debt),
             cash_and_investments=float(cash_and_investments),
-            total_equity=float(total_equity),
+            total_equity=float(total_equity or 0.0),
             minority_interest=float(minority),
             preferred_equity=float(preferred),
         )
@@ -621,6 +900,25 @@ class YFinanceClient:
                     return None
         return None
 
+    def _cell(self, df, names: tuple[str, ...], col) -> Optional[float]:
+        """Value at period `col` from the first candidate row that has one.
+
+        Unlike taking the first row that merely exists, this coalesces per
+        period, so a preferred label that is present but NaN for a period falls
+        through to the next candidate instead of becoming 0.0.
+        """
+        for name in names:
+            row = self._row(df, (name,))
+            if row is None or not hasattr(row, "get"):
+                continue
+            try:
+                v = _num(row.get(col))
+            except Exception:
+                v = None
+            if v is not None:
+                return v
+        return None
+
     @staticmethod
     def _norm(label: object) -> str:
         """Normalize a row label for tolerant matching."""
@@ -628,13 +926,22 @@ class YFinanceClient:
 
     @staticmethod
     def _year_of(col: object) -> Optional[int]:
-        """Extract a calendar year from a period-end column label."""
+        """Fiscal-year label from a period-end column label.
+
+        The calendar year of the period end, except that a 52/53-week year
+        ending in the first two weeks of January takes the prior year (the same
+        rule as the EDGAR parser), so it does not share a label with the next
+        fiscal year ending in late December.
+        """
         # pandas Timestamp / datetime expose `.year`.
         yr = getattr(col, "year", None)
         if isinstance(yr, int):
-            return yr
+            month, day = getattr(col, "month", 0), getattr(col, "day", 0)
+            return yr - 1 if (month == 1 and isinstance(day, int) and day <= 14) else yr
         # Fallback: parse a leading 4-digit year from the string form.
         s = str(col)
+        if len(s) >= 10 and s[:4].isdigit() and s[5:7] == "01" and s[8:10].isdigit():
+            return int(s[:4]) - 1 if int(s[8:10]) <= 14 else int(s[:4])
         if len(s) >= 4 and s[:4].isdigit():
             return int(s[:4])
         return None
