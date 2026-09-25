@@ -332,7 +332,8 @@ def _write_dcf(ws: Worksheet, report: ValuationReport, money_fmt: str) -> None:
 
     # Selected assumption-dict entries (terminal method/growth, tax, mid-year).
     term_method = assumptions.get("terminal_method")
-    term_growth = assumptions.get("terminal_growth")
+    # The growth actually used (the model clamps it below WACC when needed).
+    term_growth = assumptions.get("terminal_growth_used", assumptions.get("terminal_growth"))
     tax_rate = assumptions.get("tax_rate")
     mid_year = assumptions.get("mid_year_convention")
     _set(ws, row, 1, "Terminal method")

@@ -656,8 +656,10 @@ def _footnotes_html(report: ValuationReport) -> str:
             if is_num(getattr(wacc, "cost_of_equity", None)):
                 items.append(("Cost of equity", _fmt_pct(wacc.cost_of_equity, 2)))
         adict = getattr(dcf, "assumptions", {}) or {}
-        if is_num(adict.get("terminal_growth")):
-            items.append(("Terminal growth", _fmt_pct(adict.get("terminal_growth"), 2)))
+        # The growth actually used (the model clamps it below WACC when needed).
+        g_used = adict.get("terminal_growth_used", adict.get("terminal_growth"))
+        if is_num(g_used):
+            items.append(("Terminal growth", _fmt_pct(g_used, 2)))
         if adict.get("terminal_method"):
             items.append(("Terminal method", _esc(adict.get("terminal_method"))))
         if is_num(adict.get("tax_rate")):

@@ -2,7 +2,9 @@
 
 This is the public entry point. Each model is run defensively so that one model
 failing (e.g. no dividends -> no DDM, or a thin EDGAR record) never sinks the
-whole valuation -- failures become `warnings` on the report.
+whole valuation -- failures become `warnings` on the report, as do the fallbacks
+and clamps each model records in its notes (prefixed with the model name) and
+any method left out of the blended target.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from .schemas import (
     MacroAssumptions,
     ValuationReport,
 )
-from .utils import median
+from .utils import is_num, median
 
 
 def value_company(
@@ -66,6 +68,8 @@ def value_company(
             from .models.dcf import run_dcf as _run_dcf
 
             report.dcf = _run_dcf(company, macro, dcf_assumptions, current_price)
+            _add_notes(report, "WACC", report.dcf.wacc.detail.get("notes"))
+            _add_notes(report, "DCF", report.dcf.assumptions.get("notes"))
         except Exception as exc:  # noqa: BLE001 - degrade, don't crash
             report.warnings.append(f"DCF failed: {exc}")
 
@@ -90,6 +94,8 @@ def value_company(
             report.ddm = _run_ddm(company, macro, ddm_assumptions, current_price)
             if report.ddm is None:
                 report.warnings.append("DDM skipped: company pays no dividend.")
+            else:
+                _add_notes(report, "DDM", report.ddm.detail.get("notes"))
         except Exception as exc:  # noqa: BLE001
             report.warnings.append(f"DDM failed: {exc}")
 
@@ -99,6 +105,7 @@ def value_company(
             from .models.ddm_fcfe import run_fcfe as _run_fcfe
 
             report.fcfe = _run_fcfe(company, macro, ddm_assumptions, current_price)
+            _add_notes(report, "FCFE", report.fcfe.detail.get("notes"))
         except Exception as exc:  # noqa: BLE001
             report.warnings.append(f"FCFE failed: {exc}")
 
@@ -126,8 +133,26 @@ def value_company(
     return report
 
 
+def _add_notes(report: ValuationReport, label: str, notes) -> None:
+    """Surface a model's recorded fallbacks/clamps as ``"<label>: <note>"`` warnings."""
+    for note in notes or []:
+        warning = f"{label}: {note}"
+        if warning not in report.warnings:
+            report.warnings.append(warning)
+
+
 def _fallback_football_field(report: ValuationReport) -> list[FootballFieldRow]:
-    """Minimal football field if the model helper failed -- one bar per method."""
+    """Minimal football field if the model helper failed -- one bar per method.
+
+    Self-contained on purpose (it runs when models.sensitivity failed). Bands are
+    ordered so low <= base <= high holds for negative prices too.
+    """
+    def band(name: str, p, pct: float) -> Optional[FootballFieldRow]:
+        if not is_num(p):
+            return None
+        a, b = p * (1.0 - pct), p * (1.0 + pct)
+        return FootballFieldRow(name, min(a, b), p, max(a, b))
+
     rows: list[FootballFieldRow] = []
     m = report.company.market
     if m.fifty_two_week_low and m.fifty_two_week_high:
@@ -137,8 +162,7 @@ def _fallback_football_field(report: ValuationReport) -> list[FootballFieldRow]:
             )
         )
     if report.dcf:
-        p = report.dcf.implied_price
-        rows.append(FootballFieldRow("DCF", p * 0.85, p, p * 1.15))
+        rows.append(band("DCF", report.dcf.implied_price, 0.15))
     if report.comps and report.comps.implied_price_summary:
         s = report.comps.implied_price_summary
         if s.get("low") and s.get("high"):
@@ -146,16 +170,21 @@ def _fallback_football_field(report: ValuationReport) -> list[FootballFieldRow]:
                 FootballFieldRow("Comps", s["low"], s.get("median", report.current_price), s["high"])
             )
     if report.ddm:
-        p = report.ddm.implied_price
-        rows.append(FootballFieldRow("DDM", p * 0.9, p, p * 1.1))
+        rows.append(band("DDM", report.ddm.implied_price, 0.10))
     if report.fcfe:
-        p = report.fcfe.implied_price
-        rows.append(FootballFieldRow("FCFE", p * 0.9, p, p * 1.1))
-    return rows
+        rows.append(band("FCFE", report.fcfe.implied_price, 0.10))
+    return [r for r in rows if r is not None]
 
 
 def _build_summary(report: ValuationReport) -> dict:
-    """Collect each method's central estimate and a blended (median) target."""
+    """Collect each method's central estimate and a blended (median) target.
+
+    ``methods`` keeps every method's value for display. The blend differs in two
+    ways, each recorded in ``report.warnings``: a price of exactly 0 (the
+    placeholder the models return when they cannot value the company) or a
+    non-finite price is left out, and a negative price (claims senior to common
+    equity exceed the value) counts as 0, because equity cannot be worth less.
+    """
     methods: dict[str, float] = {}
     if report.dcf:
         methods["DCF"] = report.dcf.implied_price
@@ -166,7 +195,22 @@ def _build_summary(report: ValuationReport) -> dict:
     if report.fcfe:
         methods["FCFE"] = report.fcfe.implied_price
 
-    blended = median(list(methods.values()))
+    blend: list[float] = []
+    for name, price in methods.items():
+        if is_num(price) and price > 0:
+            blend.append(price)
+            continue
+        if is_num(price) and price < 0:
+            blend.append(0.0)
+            warning = (f"{name} implies negative equity ({price:.2f} per share); "
+                       "counted as 0.00 in the blended target.")
+        else:
+            reason = "non-finite implied price" if not is_num(price) else "no valuation (0.00)"
+            warning = f"{name} excluded from blended target: {reason}."
+        if warning not in report.warnings:
+            report.warnings.append(warning)
+
+    blended = median(blend)
     cur = report.current_price
     return {
         "ticker": report.company.ticker,

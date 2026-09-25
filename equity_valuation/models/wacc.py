@@ -78,8 +78,11 @@ def compute_wacc(company: CompanyData, macro: MacroAssumptions) -> WACCResult:
     After-tax cost of debt:  kd_at = kd_pretax * (1 - tax).
 
     Weights use MARKET values: E = market_cap, D = total_debt (book proxy).
-        w_e = E / (E + D),  w_d = D / (E + D).  If E + D == 0 -> treat as
-        all-equity (w_e = 1, w_d = 0).
+        w_e = E / (E + D),  w_d = D / (E + D).
+        A missing/zero/negative market cap is the providers' "unknown" sentinel,
+        so E falls back to price x market shares_outstanding, then price x the
+        latest positive diluted_shares. If E is still unknown -> all-equity
+        (w_e = 1, w_d = 0), never all-debt.
 
     WACC = w_e * ke + w_d * kd_at.
 
@@ -144,23 +147,38 @@ def compute_wacc(company: CompanyData, macro: MacroAssumptions) -> WACCResult:
                     f"derived cost of debt {derived:.4f} outside [0.01,0.15]; "
                     f"using rf+spread"
                 )
-            else:
+            elif total_debt > 0:
+                # (With no debt the cost of debt carries zero weight: nothing to flag.)
                 notes.append("cost of debt not derivable; using rf+spread")
 
     after_tax_cost_of_debt = kd_pretax * (1.0 - tax)
 
     # --- market-value weights ---------------------------------------------- #
+    # A market cap of 0 is what the market client reports when Yahoo's quote
+    # summary fails (price * 0 shares), so treat <= 0 as unknown, not as E = 0
+    # (which would put 100% weight on debt and collapse WACC to kd_at).
     equity_value = getattr(market, "market_cap", None) if market is not None else None
-    if not is_num(equity_value) or equity_value < 0:
+    if not is_num(equity_value) or equity_value <= 0:
         equity_value = 0.0
-        notes.append("market_cap unavailable; equity weight may be unreliable")
+        price = getattr(market, "price", None) if market is not None else None
+        shares = getattr(market, "shares_outstanding", None) if market is not None else None
+        diluted = [s for s in (getattr(fin, "diluted_shares", None) or []) if is_num(s) and s > 0] \
+            if fin is not None else []
+        if is_num(price) and price > 0:
+            if is_num(shares) and shares > 0:
+                equity_value = price * shares
+                notes.append("market_cap unavailable; using price x shares_outstanding")
+            elif diluted:
+                equity_value = price * diluted[-1]
+                notes.append("market_cap unavailable; using price x latest diluted_shares")
 
     total_cap = equity_value + total_debt
-    if total_cap <= 0:
-        # Degenerate: no capital structure information -> assume all equity.
+    if equity_value <= 0:
+        # No usable equity value (or no capital structure at all) -> assume all
+        # equity rather than letting the debt weight absorb 100%.
         weight_equity = 1.0
         weight_debt = 0.0
-        notes.append("E+D == 0; defaulting to all-equity weights")
+        notes.append("equity market value unavailable; defaulting to all-equity weights")
     else:
         weight_equity = equity_value / total_cap
         weight_debt = total_debt / total_cap

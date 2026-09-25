@@ -28,12 +28,12 @@ class DemoResultTests(unittest.TestCase):
         # The README "Results" table quotes these figures; keep them in step.
         s = _demo_report().summary
         self.assertAlmostEqual(s["current_price"], 40.84, delta=0.005)
-        expected = {"DCF": 33.38, "Comps (median)": 42.88, "DDM": 10.99, "FCFE": 31.25}
+        expected = {"DCF": 33.38, "Comps (median)": 42.88, "DDM": 10.99, "FCFE": 31.41}
         self.assertEqual(set(s["methods"]), set(expected))
         for method, price in expected.items():
             self.assertAlmostEqual(s["methods"][method], price, delta=0.005, msg=method)
-        self.assertAlmostEqual(s["blended_target"], 32.32, delta=0.005)
-        self.assertAlmostEqual(s["blended_upside"], -0.209, delta=0.0005)
+        self.assertAlmostEqual(s["blended_target"], 32.40, delta=0.005)
+        self.assertAlmostEqual(s["blended_upside"], -0.207, delta=0.0005)
         self.assertEqual(s["recommendation"], "Overvalued")
 
     def test_cli_demo_writes_excel_and_html(self):

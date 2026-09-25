@@ -30,13 +30,17 @@ from ..schemas import (
     FCFEResult,
     MacroAssumptions,
 )
-from ..utils import cagr, fade_path, is_num, mean, safe_div
+from ..utils import fade_path, incremental_ratio, is_num, mean, safe_div, series_cagr
 
 # Minimum spread required between the cost of equity and a perpetual growth rate
 # for a Gordon-style terminal/perpetuity to be finite and well-behaved. The
 # interface mandates ke - g >= 0.005; if an input growth rate violates it we clamp
 # the growth rate down so the spread is restored (recording a note).
 _MIN_KE_G_SPREAD = 0.005
+
+# Above this ROE the book equity is too thin (buybacks, write-downs) for
+# ROE x retention to say anything about reinvestment-driven growth.
+_MAX_MEANINGFUL_ROE = 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -87,11 +91,7 @@ def _shares(company: CompanyData) -> Optional[float]:
 
 def _hist_revenue_cagr(fin: AnnualFinancials) -> Optional[float]:
     """Historical revenue CAGR over the available (positive) annual series."""
-    rev = [v for v in (getattr(fin, "revenue", None) or []) if is_num(v)]
-    if len(rev) < 2:
-        return None
-    periods = len(rev) - 1
-    return cagr(rev[0], rev[-1], periods)
+    return series_cagr(getattr(fin, "revenue", None), getattr(fin, "fiscal_years", None))
 
 
 def _revenue_growth_path(fin: AnnualFinancials, terminal_growth: float, n: int) -> list[float]:
@@ -117,7 +117,8 @@ def _ratio_of_revenue(series: Optional[list], revenue: Optional[list]) -> Option
     """Average ratio of a flow series to revenue over aligned positive-revenue years.
 
     Used to turn D&A / capex into a forward % of revenue from history. Returns the
-    mean of the per-year ratios (None if nothing usable).
+    mean of the per-year ratios (None if nothing usable, including an all-zero
+    series, which is the providers' gap filler rather than a real 0%).
     """
     series = series or []
     revenue = revenue or []
@@ -125,6 +126,8 @@ def _ratio_of_revenue(series: Optional[list], revenue: Optional[list]) -> Option
     for s, r in zip(series, revenue):
         if is_num(s) and is_num(r) and r > 0:
             ratios.append(s / r)
+    if ratios and all(x == 0 for x in ratios):
+        return None
     return mean(ratios)
 
 
@@ -140,20 +143,42 @@ def _latest_net_margin(fin: AnnualFinancials) -> Optional[float]:
 # --------------------------------------------------------------------------- #
 #  Dividend Discount Model
 # --------------------------------------------------------------------------- #
-def _sustainable_growth(fin: AnnualFinancials, company: CompanyData) -> Optional[float]:
+def _sustainable_growth(
+    fin: AnnualFinancials, company: CompanyData, notes: Optional[list[str]] = None
+) -> Optional[float]:
     """Sustainable growth = ROE * retention ratio.
 
     ROE = latest net income / book equity. Retention = 1 - payout, where payout =
-    dividends paid / net income (clamped to [0, 1]). Returns None if inputs are
-    unusable (e.g. non-positive equity or net income).
+    dividends paid / net income (clamped to [0, 1]); if the dividends-paid line is
+    missing/zero-filled, dividends are estimated as DPS x shares. Returns None if
+    inputs are unusable: non-positive net income, non-positive book equity (common
+    for buyback-heavy dividend payers) or an ROE above ``_MAX_MEANINGFUL_ROE``.
+    The caller then falls back to the dividend CAGR or terminal growth.
     """
+    notes = notes if notes is not None else []
     ni = (getattr(fin, "net_income", None) or [None])[-1]
     equity = getattr(getattr(company, "balance_sheet", None), "total_equity", None)
-    roe = safe_div(ni, equity)
-    if not is_num(roe) or not is_num(ni) or ni <= 0:
+    if not is_num(ni) or ni <= 0:
+        return None
+    if not is_num(equity) or equity <= 0:
+        notes.append("Book equity unavailable or non-positive; ROE x retention skipped "
+                     "for high growth.")
+        return None
+    roe = ni / equity
+    if roe > _MAX_MEANINGFUL_ROE:
+        notes.append(f"ROE {roe:.0%} not meaningful (thin book equity); ROE x retention "
+                     "skipped for high growth.")
         return None
 
     div_paid = (getattr(fin, "dividends_paid", None) or [None])[-1]
+    if not is_num(div_paid) or div_paid <= 0:
+        # The DDM only runs for payers (DPS > 0), so a 0 here is a data gap, not
+        # 100% retention.
+        dps = getattr(getattr(company, "market", None), "dividend_per_share", None)
+        shares = _shares(company)
+        if is_num(dps) and dps > 0 and shares:
+            div_paid = dps * shares
+            notes.append("Dividends paid unreported; payout estimated from DPS x shares.")
     payout = safe_div(div_paid, ni)
     if not is_num(payout):
         payout = 0.0
@@ -163,11 +188,9 @@ def _sustainable_growth(fin: AnnualFinancials, company: CompanyData) -> Optional
 
 
 def _dividend_cagr(fin: AnnualFinancials) -> Optional[float]:
-    """CAGR of total dividends paid over the available positive history."""
-    div = [v for v in (getattr(fin, "dividends_paid", None) or []) if is_num(v) and v > 0]
-    if len(div) < 2:
-        return None
-    return cagr(div[0], div[-1], len(div) - 1)
+    """CAGR of total dividends paid over the available positive history (years
+    between the first and last positive entries, so a gap is not compressed)."""
+    return series_cagr(getattr(fin, "dividends_paid", None), getattr(fin, "fiscal_years", None))
 
 
 def run_ddm(
@@ -266,7 +289,8 @@ def run_ddm(
         detail["method"] = method
 
     gh = _initial_high_growth(assumptions, fin, company, ke, notes)
-    h_years = assumptions.high_growth_years if (assumptions.high_growth_years or 0) > 0 else 5
+    hgy = assumptions.high_growth_years
+    h_years = max(1, int(hgy)) if (is_num(hgy) and hgy > 0) else 5
     g = _clamp_terminal_g(g_terminal, "Two-stage terminal")
 
     # Stage 1: explicit dividends grown at gh, discounted at ke.
@@ -336,7 +360,7 @@ def _initial_high_growth(
     if not is_num(gh):
         candidates: list[float] = []
         if fin is not None:
-            sg = _sustainable_growth(fin, company)
+            sg = _sustainable_growth(fin, company, notes)
             if is_num(sg):
                 candidates.append(sg)
             dcg = _dividend_cagr(fin)
@@ -378,19 +402,20 @@ def run_fcfe(
 
     ΔDebt CHOICE (documented): we assume the firm maintains a constant
     debt-to-revenue ratio, so net new borrowing grows the debt balance in line
-    with revenue: ΔDebt_t = total_debt * (revenue_t / revenue_{t-1} - 1). This is
-    a standard "constant capital structure" simplification when no explicit debt
-    schedule is available. If the current debt balance or base revenue is
-    unavailable, ΔDebt falls back to 0 (a note is recorded). This keeps leverage
-    neutral rather than assuming aggressive re-levering.
+    with revenue: ΔDebt_t = (total_debt / revenue_0) * (revenue_t - revenue_{t-1}),
+    i.e. D_{t-1} * g_t. This is a standard "constant capital structure"
+    simplification when no explicit debt schedule is available. If the current
+    debt balance is unavailable, ΔDebt falls back to 0 (a note is recorded). This
+    keeps leverage neutral rather than assuming aggressive re-levering.
 
     Projection mechanics:
       * Revenue grows along the historical-CAGR path faded to terminal growth
         (same derivation philosophy as the DCF, re-implemented locally).
       * NetIncome_t = latest net margin * projected revenue_t.
       * D&A_t / Capex_t = (historical % of revenue) * revenue_t.
-      * ΔNWC_t = (historical avg ΔNWC / Δrevenue) * Δrevenue_t (small/zero if the
-        history is unstable -- ΔNWC series is often zero-filled by the provider).
+      * ΔNWC_t = (historical pooled ΔNWC / Δrevenue) * Δrevenue_t, set to 0 when
+        the ratio falls outside [0, 1], as in the DCF (the ΔNWC series is often
+        zero-filled by the provider).
       * Discount each FCFE_t at the cost of equity (CAPM).
       * Terminal value: Gordon growth on FCFE_N at terminal_growth, discounted N
         years (require ke - g >= 0.005, clamp g if needed).
@@ -401,7 +426,8 @@ def run_fcfe(
     fin = getattr(company, "financials", None)
     bs = getattr(company, "balance_sheet", None)
 
-    years_out = assumptions.forecast_years if (assumptions.forecast_years or 0) > 0 else 5
+    fy = assumptions.forecast_years
+    years_out = max(1, int(fy)) if (is_num(fy) and fy > 0) else 5
     g_terminal = assumptions.terminal_growth if is_num(assumptions.terminal_growth) else 0.0
     shares = _shares(company)
 
@@ -467,6 +493,11 @@ def run_fcfe(
     if not is_num(nwc_pct_delta):
         nwc_pct_delta = 0.0
         notes.append("Unstable/absent ΔNWC history; incremental NWC set to 0% of Δrevenue.")
+    elif not 0.0 <= nwc_pct_delta <= 1.0:
+        # Same plausibility band as the DCF: outside [0, 1] is noise, not intensity.
+        notes.append(f"Derived ΔNWC/Δrevenue {nwc_pct_delta:.3f} implausible; "
+                     "incremental NWC set to 0% of Δrevenue.")
+        nwc_pct_delta = 0.0
 
     # Current debt balance for the ΔDebt (debt grows with revenue) policy.
     total_debt = getattr(bs, "total_debt", None) if bs is not None else None
@@ -484,6 +515,8 @@ def run_fcfe(
         )
 
     growth_path = _revenue_growth_path(fin, g_term, years_out)
+    if _hist_revenue_cagr(fin) is None:
+        notes.append("Historical revenue CAGR unavailable; revenue growth held at terminal growth.")
     detail["revenue_growth_path"] = growth_path
     detail["net_margin"] = net_margin
     detail["da_pct_revenue"] = da_pct
@@ -491,6 +524,8 @@ def run_fcfe(
     detail["nwc_pct_delta_revenue"] = nwc_pct_delta
 
     # --- project the FCFE series --------------------------------------------- #
+    # base_revenue > 0 is guaranteed by the guard above.
+    debt_to_revenue = total_debt / float(base_revenue)
     revenues: list[float] = []
     fcfe: list[float] = []
     pv_fcfe: list[float] = []
@@ -504,8 +539,9 @@ def run_fcfe(
         da_t = da_pct * rev_t
         capex_t = capex_pct * rev_t
         dnwc_t = nwc_pct_delta * d_rev
-        # ΔDebt: keep debt/revenue constant -> borrow in proportion to revenue growth.
-        ddebt_t = total_debt * g if total_debt else 0.0
+        # ΔDebt: keep debt/revenue constant -> borrow (D0/R0) per unit of revenue
+        # growth, which equals D_{t-1} * g_t on the rolled-forward balance.
+        ddebt_t = debt_to_revenue * d_rev
 
         fcfe_t = ni_t + da_t - capex_t - dnwc_t + ddebt_t
         df = 1.0 / ((1.0 + ke) ** t)
@@ -551,26 +587,12 @@ def run_fcfe(
 
 
 def _nwc_per_revenue_change(fin: AnnualFinancials) -> Optional[float]:
-    """Average ΔNWC as a fraction of the year-over-year change in revenue.
+    """Pooled ΔNWC as a fraction of the year-over-year change in revenue.
 
     The provider stores ``change_in_nwc`` already as the per-year increase in net
-    working capital (positive = cash use). We pair each year's ΔNWC with that
-    year's revenue change and average the ratios over the years where the revenue
-    change is non-trivial. Returns None if there is no stable signal (the caller
-    then defaults to 0, consistent with the DCF's treatment).
+    working capital (positive = cash use). Each year's ΔNWC pairs with that year's
+    revenue change, pooled as sum(ΔNWC) / sum(Δrevenue) so a near-flat year cannot
+    dominate (the DCF uses the same estimator). Returns None if there is no usable
+    history; the caller applies the DCF's [0, 1] plausibility band.
     """
-    rev = getattr(fin, "revenue", None) or []
-    nwc = getattr(fin, "change_in_nwc", None) or []
-    if len(rev) < 2 or len(nwc) < 2:
-        return None
-    ratios: list[float] = []
-    for i in range(1, min(len(rev), len(nwc))):
-        if not (is_num(rev[i]) and is_num(rev[i - 1]) and is_num(nwc[i])):
-            continue
-        d_rev = rev[i] - rev[i - 1]
-        # Ignore years with a negligible revenue change -- the ratio explodes and
-        # is not informative about the structural NWC intensity.
-        if abs(d_rev) < 1e-9:
-            continue
-        ratios.append(nwc[i] / d_rev)
-    return mean(ratios)
+    return incremental_ratio(getattr(fin, "change_in_nwc", None), getattr(fin, "revenue", None))

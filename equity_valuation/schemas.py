@@ -125,7 +125,9 @@ class DCFAssumptions:
     capex_pct_revenue: Optional[float] = None
     da_pct_revenue: Optional[float] = None
     nwc_pct_revenue: Optional[float] = None  # incremental NWC as % of revenue change
-    tax_rate: Optional[float] = None         # overrides macro tax rate inside the DCF
+    # Overrides the tax rate on NOPAT in the FCFF projection. The WACC debt tax
+    # shield keeps using MacroAssumptions.tax_rate (else the historical effective rate).
+    tax_rate: Optional[float] = None
     mid_year_convention: bool = True
 
 

@@ -16,15 +16,28 @@ units; all rates are decimals; annual series run oldest -> newest.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import Optional
+
 from ..schemas import (
     CompanyData,
     DCFAssumptions,
     DCFResult,
     MacroAssumptions,
 )
-from ..utils import cagr, fade_path, is_num, mean, safe_div
+from ..utils import (
+    fade_path,
+    incremental_ratio,
+    is_num,
+    mean,
+    net_debt_parts,
+    safe_div,
+    series_cagr,
+)
 from .. import config
 from .wacc import compute_wacc, effective_tax_rate
+
+TERMINAL_METHODS = ("gordon", "exit_multiple")
 
 
 # --------------------------------------------------------------------------- #
@@ -50,6 +63,64 @@ def _hist_ratio_mean(numerators, denominators):
     return mean(ratios)
 
 
+def _all_zero(series) -> bool:
+    """True if a series has entries and every finite one is 0 (a zero-filled gap)."""
+    vals = [v for v in (series or []) if is_num(v)]
+    return bool(vals) and all(v == 0 for v in vals)
+
+
+def _ebit_history(fin) -> tuple[list, Optional[str]]:
+    """Historical EBIT with zero-filled (unreported) years rebuilt from pretax.
+
+    Providers write 0.0 when a filer has no operating-income tag (e.g. single-step
+    income statements). A 0 there is a gap, not a reading, so where pretax income
+    exists the year is approximated as pretax income + interest expense.
+    """
+    ebit = list(getattr(fin, "ebit", None) or []) if fin is not None else []
+    pretax = list(getattr(fin, "pretax_income", None) or []) if fin is not None else []
+    interest = list(getattr(fin, "interest_expense", None) or []) if fin is not None else []
+    out, rebuilt = [], False
+    for i, e in enumerate(ebit):
+        p = pretax[i] if i < len(pretax) else None
+        if (not is_num(e) or e == 0) and is_num(p) and p != 0:
+            it = interest[i] if i < len(interest) and is_num(interest[i]) else 0.0
+            out.append(p + abs(it))
+            rebuilt = True
+        else:
+            out.append(e)
+    note = ("EBIT not reported for some years; approximated as pretax income + "
+            "interest expense") if rebuilt else None
+    return out, note
+
+
+def start_ebit_margin(fin, hist_revenue, base_revenue) -> tuple[Optional[float], Optional[str]]:
+    """(starting EBIT margin, note): latest EBIT / base revenue, else the trailing
+    mean margin, ignoring zero-filled EBIT years. None if nothing is usable.
+
+    Shared with the sensitivity grid so its margin axis centres on the same start.
+    """
+    hist_ebit, note = _ebit_history(fin)
+    reported = [e if (is_num(e) and e != 0) else None for e in hist_ebit]
+    latest = reported[-1] if reported else None
+    margin = safe_div(latest, base_revenue) if (is_num(base_revenue) and base_revenue > 0) else None
+    if margin is None:
+        # Fall back to the trailing average EBIT margin.
+        margin = _hist_ratio_mean(reported, hist_revenue)
+    return margin, note
+
+
+def resolve_terminal_method(assumptions) -> tuple[str, Optional[str]]:
+    """(terminal method actually used, note): normalise case/whitespace and fall
+    back to Gordon for an unknown method or an exit multiple without a multiple."""
+    raw = assumptions.terminal_method if assumptions else None
+    method = str(raw or "gordon").strip().lower()
+    if method not in TERMINAL_METHODS:
+        return "gordon", f"unknown terminal_method {raw!r}; falling back to Gordon"
+    if method == "exit_multiple" and not is_num(getattr(assumptions, "exit_ev_ebitda", None)):
+        return "gordon", "exit_ev_ebitda missing for exit_multiple method; falling back to Gordon"
+    return method, None
+
+
 # --------------------------------------------------------------------------- #
 #  Main entry point
 # --------------------------------------------------------------------------- #
@@ -63,7 +134,9 @@ def run_dcf(
 
     Degrades gracefully on missing data: any unavailable driver falls back to a
     documented default and the choice is recorded in ``DCFResult.assumptions``
-    (which carries a human-readable ``notes`` list).
+    (which carries a human-readable ``notes`` list). Raises ``ValueError`` only
+    when there is no positive base revenue to project from (an FCFF DCF is not
+    meaningful then; the engine records the failure as a warning).
     """
     notes: list[str] = []
 
@@ -72,8 +145,18 @@ def run_dcf(
     w = wacc_result.wacc
     # Guard a degenerate / non-positive WACC so discounting stays well-defined.
     if not is_num(w) or w <= 0:
-        w = config.DEFAULT_RISK_FREE_RATE + config.DEFAULT_EQUITY_RISK_PREMIUM
-        notes.append(f"WACC non-positive/invalid; using fallback {w:.4f}")
+        computed = w
+        rf = wacc_result.detail.get("risk_free_rate")
+        erp = wacc_result.detail.get("equity_risk_premium")
+        # Beta-1 cost of equity on the caller's macro inputs, else config defaults.
+        w = rf + erp if (is_num(rf) and is_num(erp) and rf + erp > 0) else (
+            config.DEFAULT_RISK_FREE_RATE + config.DEFAULT_EQUITY_RISK_PREMIUM)
+        notes.append(f"computed WACC {computed:.4f} non-positive/invalid; "
+                     f"discounting at fallback rf+ERP {w:.4f}")
+        # Report the rate actually used (UI, exports and sensitivity labels read
+        # DCFResult.wacc.wacc); keep the rejected value for reference.
+        wacc_result = replace(wacc_result, wacc=w,
+                              detail={**wacc_result.detail, "wacc": w, "wacc_computed": computed})
 
     fin = getattr(company, "financials", None)
     bs = getattr(company, "balance_sheet", None)
@@ -91,9 +174,9 @@ def run_dcf(
     hist_revenue = list(getattr(fin, "revenue", None) or []) if fin is not None else []
     base_revenue = _latest(hist_revenue)
     if not is_num(base_revenue) or base_revenue <= 0:
-        # No anchor for projections — return an empty/zeroed result rather than crash.
-        base_revenue = 0.0
-        notes.append("latest revenue unavailable; DCF produces a zero valuation")
+        # No anchor for projections: EV would be 0 and the "price" just
+        # -net_debt/shares, which is not a valuation. Fail loudly instead.
+        raise ValueError("no positive latest revenue to project from; an FCFF DCF is not meaningful")
 
     growth_path = None
     if assumptions and assumptions.revenue_growth:
@@ -105,11 +188,9 @@ def run_dcf(
             growth_path = gp + [gp[-1]] * (n - len(gp))
             notes.append("revenue_growth shorter than forecast_years; padded with last value")
     if growth_path is None:
-        # Derive base growth from historical revenue CAGR over the available span.
-        clean_rev = [r for r in hist_revenue if is_num(r)]
-        base_growth = None
-        if len(clean_rev) >= 2:
-            base_growth = cagr(clean_rev[0], clean_rev[-1], len(clean_rev) - 1)
+        # Derive base growth from historical revenue CAGR over the available span
+        # (zero-filled years are skipped as endpoints but still count as periods).
+        base_growth = series_cagr(hist_revenue, getattr(fin, "fiscal_years", None))
         if base_growth is None:
             base_growth = terminal_growth
             notes.append("historical revenue CAGR unavailable; starting growth at terminal_growth")
@@ -127,12 +208,9 @@ def run_dcf(
         prev = cur
 
     # ----- 3) EBIT margin path -------------------------------------------- #
-    hist_ebit = list(getattr(fin, "ebit", None) or []) if fin is not None else []
-    latest_ebit = _latest(hist_ebit)
-    start_margin = safe_div(latest_ebit, base_revenue) if base_revenue else None
-    if start_margin is None:
-        # Fall back to the trailing average EBIT margin, else a modest default.
-        start_margin = _hist_ratio_mean(hist_ebit, hist_revenue)
+    start_margin, ebit_note = start_ebit_margin(fin, hist_revenue, base_revenue)
+    if ebit_note:
+        notes.append(ebit_note)
     if start_margin is None:
         start_margin = 0.0
         notes.append("EBIT margin unavailable; defaulting to 0")
@@ -152,6 +230,11 @@ def run_dcf(
     else:
         tax = effective_tax_rate(fin, config.DEFAULT_MARGINAL_TAX_RATE)
         tax_source = "effective (historical)"
+        if tax <= 0:
+            # Kept as documented (pass-throughs genuinely pay ~0%), but flag it:
+            # providers also zero-fill an unreported tax line.
+            notes.append("historical effective tax rate is 0% (tax expense zero or unreported); "
+                         "NOPAT is untaxed -- set a tax rate if that is not intended")
     nopat = [e * (1.0 - tax) for e in ebit]
 
     # ----- 5) D&A, Capex, dNWC -------------------------------------------- #
@@ -161,7 +244,8 @@ def run_dcf(
     if assumptions and is_num(assumptions.da_pct_revenue):
         da_pct = assumptions.da_pct_revenue
     else:
-        da_pct = _hist_ratio_mean(hist_da, hist_revenue)
+        # An all-zero history is the providers' gap filler, not a real 0%.
+        da_pct = None if _all_zero(hist_da) else _hist_ratio_mean(hist_da, hist_revenue)
         if da_pct is None:
             da_pct = 0.0
             notes.append("D&A %revenue unavailable; defaulting to 0")
@@ -169,7 +253,7 @@ def run_dcf(
     if assumptions and is_num(assumptions.capex_pct_revenue):
         capex_pct = assumptions.capex_pct_revenue
     else:
-        capex_pct = _hist_ratio_mean(hist_capex, hist_revenue)
+        capex_pct = None if _all_zero(hist_capex) else _hist_ratio_mean(hist_capex, hist_revenue)
         if capex_pct is None:
             capex_pct = 0.0
             notes.append("capex %revenue unavailable; defaulting to 0")
@@ -178,19 +262,11 @@ def run_dcf(
     if assumptions and is_num(assumptions.nwc_pct_revenue):
         nwc_pct = assumptions.nwc_pct_revenue
     else:
-        # Derive from history: dNWC_i / dRevenue_i. Unstable -> 0 (conservative).
+        # Derive from history: pooled sum(dNWC_i) / sum(dRevenue_i), so a single
+        # near-flat revenue year cannot dominate. change_in_nwc[i] aligns with
+        # revenue[i]. Outside [0, 1] -> treat as no usable signal -> 0.
         hist_dnwc = list(getattr(fin, "change_in_nwc", None) or []) if fin is not None else []
-        nwc_ratios = []
-        rev_clean = [r for r in hist_revenue if is_num(r)]
-        # change_in_nwc[i] aligns with revenue[i]; pair with the revenue delta.
-        for i in range(1, min(len(hist_dnwc), len(hist_revenue))):
-            d_rev = hist_revenue[i] - hist_revenue[i - 1] \
-                if is_num(hist_revenue[i]) and is_num(hist_revenue[i - 1]) else None
-            if is_num(hist_dnwc[i]) and d_rev is not None and d_rev != 0:
-                r = safe_div(hist_dnwc[i], d_rev)
-                if r is not None:
-                    nwc_ratios.append(r)
-        nwc_pct = mean(nwc_ratios)
+        nwc_pct = incremental_ratio(hist_dnwc, hist_revenue)
         if nwc_pct is None or nwc_pct < 0 or nwc_pct > 1:
             # Unstable/implausible incremental ratio -> assume zero working-capital drag.
             if nwc_pct is not None:
@@ -218,22 +294,18 @@ def run_dcf(
     pv_fcff = [fcff[i] * discount_factors[i] for i in range(n)]
 
     # ----- 7) terminal value ---------------------------------------------- #
-    terminal_method = (assumptions.terminal_method if assumptions and assumptions.terminal_method
-                       else "gordon")
+    # An unknown method, or exit_multiple without a multiple, falls back to Gordon
+    # (with a note) so we still produce a number.
+    terminal_method, method_note = resolve_terminal_method(assumptions)
+    if method_note:
+        notes.append(method_note)
     fcff_n = fcff[-1] if fcff else 0.0
     ebitda_n = (ebit[-1] + da[-1]) if (ebit and da) else 0.0
 
     g_used = terminal_growth
     if terminal_method == "exit_multiple":
-        exit_mult = assumptions.exit_ev_ebitda if (assumptions and is_num(assumptions.exit_ev_ebitda)) \
-            else None
-        if exit_mult is None:
-            # Required input missing — fall back to Gordon so we still produce a number.
-            notes.append("exit_ev_ebitda missing for exit_multiple method; falling back to Gordon")
-            terminal_method = "gordon"
-        else:
-            terminal_value = ebitda_n * exit_mult
-    if terminal_method == "gordon":
+        terminal_value = ebitda_n * assumptions.exit_ev_ebitda
+    else:
         # Require WACC - g >= MAX_TERMINAL_GROWTH_VS_WACC; clamp g if violated.
         if w - g_used < config.MAX_TERMINAL_GROWTH_VS_WACC:
             clamped = w - config.MAX_TERMINAL_GROWTH_VS_WACC
@@ -271,15 +343,14 @@ def run_dcf(
     # ----- 8) bridge to equity & implied price ---------------------------- #
     enterprise_value = sum(pv_fcff) + pv_terminal
 
-    # net_debt already = total_debt - cash; add minority interest & preferred to
-    # bridge from enterprise to common-equity value.
-    net_debt = bs.net_debt if (bs is not None and is_num(getattr(bs, "net_debt", None))) else 0.0
+    # net_debt = total_debt - cash (each missing component assumed 0 on its own);
+    # add minority interest & preferred to bridge from enterprise to common equity.
+    net_debt, bridge_notes = net_debt_parts(bs)
+    notes.extend(bridge_notes)
     minority = getattr(bs, "minority_interest", 0.0) if bs is not None else 0.0
     preferred = getattr(bs, "preferred_equity", 0.0) if bs is not None else 0.0
     minority = minority if is_num(minority) else 0.0
     preferred = preferred if is_num(preferred) else 0.0
-    if bs is None or not is_num(getattr(bs, "net_debt", None)):
-        notes.append("balance-sheet net debt unavailable; assumed 0")
 
     total_claims = net_debt + minority + preferred
     equity_value = enterprise_value - total_claims

@@ -20,7 +20,10 @@ Design notes:
     render a blank cell.
   * Row/column *values* are the ACTUAL resulting levels (e.g. the realized WACC
     read back off the returned ``DCFResult``), not the raw deltas, so the labels
-    on the grid are economically meaningful.
+    on the grid are economically meaningful. A cell the DCF could only price by
+    changing its inputs (terminal g clamped below WACC, or a non-positive WACC
+    replaced by the fallback rate) is stored as NaN rather than shown under a
+    label it does not represent.
 
 """
 
@@ -36,8 +39,8 @@ from ..schemas import (
     MacroAssumptions,
     SensitivityResult,
 )
-from ..utils import is_num, median
-from .dcf import run_dcf
+from ..utils import is_num, median, net_debt_parts
+from .dcf import resolve_terminal_method, run_dcf, start_ebit_margin
 
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +55,13 @@ def _safe_implied_price(
     """Run one DCF cell, returning (implied_price, realized_wacc).
 
     Never raises: on any failure both elements degrade to ``float('nan')`` so the
-    caller can keep building a rectangular grid.
+    caller can keep building a rectangular grid. The price is also NaN when the
+    DCF had to clamp the cell's terminal growth or replace a non-positive WACC,
+    since the cell would then not be priced at its row/column labels.
     """
     try:
         result = run_dcf(company, macro, assumptions, current_price)
-    except Exception:  # pragma: no cover - defensive; run_dcf shouldn't raise
+    except Exception:  # defensive: e.g. no positive revenue base
         return float("nan"), float("nan")
 
     price = getattr(result, "implied_price", None)
@@ -66,31 +71,39 @@ def _safe_implied_price(
     # level the model actually used (rf bump propagates through CAPM + weights).
     realized_wacc = float("nan")
     wacc_obj = getattr(result, "wacc", None)
+    detail = getattr(wacc_obj, "detail", None) or {}
     if wacc_obj is not None:
         w = getattr(wacc_obj, "wacc", None)
+        if "wacc_computed" in detail:
+            # Discounted at the fallback rate: keep the CAPM WACC as the (ordered)
+            # row label and blank the cell.
+            w = detail["wacc_computed"]
+            price = float("nan")
         if is_num(w):
             realized_wacc = float(w)
+
+    a = getattr(result, "assumptions", None) or {}
+    g_req, g_used = a.get("terminal_growth"), a.get("terminal_growth_used")
+    if is_num(g_req) and is_num(g_used) and g_used != g_req:
+        price = float("nan")  # g clamped to WACC - gap: not the column's growth
     return price, realized_wacc
 
 
 def _base_latest_ebit_margin(company: CompanyData) -> float:
     """Latest historical EBIT / revenue, or NaN if it can't be computed.
 
-    Mirrors the base-margin derivation inside the DCF so the margin grid is
-    centered on the same starting point the model uses.
+    Uses the DCF's own start-margin derivation so the margin grid is centered on
+    the same starting point the model uses.
     """
     fin = getattr(company, "financials", None)
     if fin is None:
         return float("nan")
-    revenue = getattr(fin, "revenue", None)
-    ebit = getattr(fin, "ebit", None)
-    if not revenue or not ebit:
-        return float("nan")
+    revenue = list(getattr(fin, "revenue", None) or [])
     rev_latest = revenue[-1] if revenue else None
-    ebit_latest = ebit[-1] if ebit else None
-    if not is_num(rev_latest) or rev_latest == 0 or not is_num(ebit_latest):
+    if not is_num(rev_latest) or rev_latest <= 0:
         return float("nan")
-    return float(ebit_latest) / float(rev_latest)
+    margin, _ = start_ebit_margin(fin, revenue, rev_latest)
+    return float(margin) if is_num(margin) else float("nan")
 
 
 # --------------------------------------------------------------------------- #
@@ -106,7 +119,9 @@ def dcf_sensitivity(
 
     Both grids force the Gordon terminal method (``terminal_method='gordon'``)
     so terminal-growth shifts have a well-defined effect; the exit-multiple
-    branch ignores terminal growth entirely.
+    branch ignores terminal growth entirely. When the headline DCF uses an exit
+    multiple, the grid titles say so, since their centre cell is then the
+    Gordon price rather than the headline.
 
     Returns a list of up to two ``SensitivityResult`` objects. A grid that can't
     be built at all (e.g. base margin unknown) is still returned, populated with
@@ -130,6 +145,11 @@ def dcf_sensitivity(
 
     # The actual terminal-growth levels are shared across both grids' columns.
     growth_levels = [base_growth + d for d in growth_deltas]
+
+    # Label the grids as Gordon-based when the headline DCF is not.
+    headline_method, _ = resolve_terminal_method(assumptions)
+    title_suffix = (" (Gordon terminal; headline DCF uses exit multiple)"
+                    if headline_method == "exit_multiple" else "")
 
     # ----------------------------------------------------------------------- #
     # Grid 1 — WACC (rows) x terminal growth (cols)
@@ -170,7 +190,7 @@ def dcf_sensitivity(
 
     results.append(
         SensitivityResult(
-            title="DCF implied price: WACC vs terminal growth",
+            title="DCF implied price: WACC vs terminal growth" + title_suffix,
             row_label="WACC",
             col_label="Terminal growth",
             row_values=row_wacc_levels,
@@ -219,7 +239,7 @@ def dcf_sensitivity(
 
     results.append(
         SensitivityResult(
-            title="DCF implied price: EBIT margin vs terminal growth",
+            title="DCF implied price: EBIT margin vs terminal growth" + title_suffix,
             row_label="EBIT margin",
             col_label="Terminal growth",
             row_values=list(margin_levels),
@@ -302,7 +322,8 @@ def build_football_field(report) -> list[FootballFieldRow]:
 
     Conventions:
       * '52-week range'  : low/high from market 52wk lo/hi, base = current_price.
-      * 'DCF'            : WACC x growth grid min/median/max if present,
+      * 'DCF'            : WACC x growth grid min/max (widened to contain the
+                            headline dcf.implied_price, which is the base),
                             else +/-15% around dcf.implied_price.
       * 'EV/EBITDA comps' / 'P/E comps': spread from comps stats applied to the
                             target metric where available, else the comps implied
@@ -362,9 +383,11 @@ def build_football_field(report) -> list[FootballFieldRow]:
             high = max(grid_vals)
             med = median(grid_vals)
             # Center on the median of the grid; if the point estimate is finite,
-            # prefer it as the base (it's the engine's headline number).
+            # prefer it as the base (it's the engine's headline number). The grid
+            # is Gordon-only, so an exit-multiple headline can fall outside it:
+            # widen the bar to contain the headline rather than moving the marker.
             base = float(dcf_implied) if is_num(dcf_implied) else float(med)
-            base = min(max(base, low), high)
+            low, high = min(low, base), max(high, base)
             rows.append(
                 FootballFieldRow(method="DCF", low=low, base=base, high=high)
             )
@@ -435,8 +458,7 @@ def _ev_bridge_inputs(company):
 
     net_debt = minority = preferred = 0.0
     if bs is not None:
-        nd = getattr(bs, "net_debt", None)
-        net_debt = float(nd) if is_num(nd) else 0.0
+        net_debt, _ = net_debt_parts(bs)
         mi = getattr(bs, "minority_interest", 0.0)
         minority = float(mi) if is_num(mi) else 0.0
         pe_eq = getattr(bs, "preferred_equity", 0.0)

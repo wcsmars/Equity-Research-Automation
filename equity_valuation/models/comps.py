@@ -32,6 +32,7 @@ from ..utils import (
     cagr,
     is_num,
     median,
+    net_debt_parts,
     safe_div,
     summary_stats,
     trim_outliers,
@@ -338,11 +339,9 @@ def run_comps(
     minority = 0.0
     preferred = 0.0
     if bs is not None:
-        try:
-            nd = bs.net_debt
-            net_debt = float(nd) if is_num(nd) else 0.0
-        except Exception:
-            net_debt = 0.0
+        # Component-wise, so a missing cash figure does not discard known debt.
+        net_debt, nd_notes = net_debt_parts(bs)
+        notes.extend(nd_notes)
         mi = getattr(bs, "minority_interest", 0.0)
         minority = float(mi) if is_num(mi) else 0.0
         pe_eq = getattr(bs, "preferred_equity", 0.0)
